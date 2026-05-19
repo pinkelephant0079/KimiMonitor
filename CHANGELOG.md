@@ -17,6 +17,19 @@
 - 一键检查更新（查询 GitHub Releases）
 - 首次发布 `.dmg` 安装包
 
+## [1.0.1] - 2026-05-19
+
+### 修复
+- 修复 Token 自动刷新端点错误（从 `api.kimi.com` 改为 `auth.kimi.com`）
+- 添加 Token 刷新必要的请求头（`X-Msh-Platform`, `X-Msh-Device-Id`）
+- 改进刷新错误信息，显示服务器返回的具体错误描述
+- 修正 `expires_at` 计算方式（当前时间 + `expires_in`）
+
+### 新增
+- Token 刷新熔断机制（连续 3 次失败停止刷新）
+- API 失联熔断机制（连续 3 次失败进入静默模式，5 分钟后再试）
+- 手动刷新重置所有熔断计数器
+
 ## [Unreleased]
 
 ### 计划中
@@ -27,4 +40,5 @@
 
 ---
 
+[1.0.1]: https://github.com/pinkelephant0079/KimiMonitor/releases/tag/v1.0.1
 [1.0.0]: https://github.com/pinkelephant0079/KimiMonitor/releases/tag/v1.0.0

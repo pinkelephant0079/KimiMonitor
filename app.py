@@ -230,14 +230,19 @@ class KimiAPIClient:
                     self._token_refresh_failures = self._max_refresh_failures
                     return False
 
+                device_id = self._read_device_id()
                 resp = requests.post(
-                    "https://api.kimi.com/coding/v1/api/oauth/token",
+                    "https://auth.kimi.com/api/oauth/token",
                     data={
                         "client_id": "17e5f671-d194-4dfb-9706-5516cb48c098",
                         "grant_type": "refresh_token",
                         "refresh_token": refresh_token,
                     },
-                    headers={"User-Agent": f"KimiMonitor/{VERSION}"},
+                    headers={
+                        "User-Agent": f"KimiMonitor/{VERSION}",
+                        "X-Msh-Platform": "kimi_cli",
+                        "X-Msh-Device-Id": device_id,
+                    },
                     timeout=10,
                 )
 
@@ -245,22 +250,29 @@ class KimiAPIClient:
                     new_data = resp.json()
                     data["access_token"] = new_data.get("access_token", "")
                     data["refresh_token"] = new_data.get("refresh_token", data.get("refresh_token", ""))
-                    data["expires_at"] = new_data.get("expires_at", time.time() + 3600)
-                    data["expires_in"] = new_data.get("expires_in", 3600)
+                    # 计算 expires_at（当前时间 + expires_in）
+                    expires_in = new_data.get("expires_in", 3600)
+                    data["expires_at"] = time.time() + expires_in
+                    data["expires_in"] = expires_in
                     with open(TOKEN_PATH, "w", encoding="utf-8") as f_out:
                         json.dump(data, f_out, indent=2)
                     self._token = data["access_token"]
                     self._token_refresh_failures = 0
                     self._consecutive_failures = 0
                     self._silent_mode = False
-                    print("[Token] 自动刷新成功")
+                    print(f"[Token] 自动刷新成功，新 token 有效期 {expires_in}s")
                     return True
                 else:
                     self._token_refresh_failures += 1
+                    try:
+                        err_body = resp.json()
+                        err_desc = err_body.get("error_description", f"HTTP {resp.status_code}")
+                    except Exception:
+                        err_desc = f"HTTP {resp.status_code}"
                     if self._token_refresh_failures >= self._max_refresh_failures:
                         self._last_error = "Token 失效，请重新登录 Kimi CLI"
                     else:
-                        self._last_error = f"刷新失败 ({self._token_refresh_failures}/{self._max_refresh_failures})"
+                        self._last_error = f"刷新失败 ({self._token_refresh_failures}/{self._max_refresh_failures}): {err_desc}"
                     return False
 
         except Exception as e:

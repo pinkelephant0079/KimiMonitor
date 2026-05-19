@@ -1,0 +1,49 @@
+++ date
++ echo 'Launcher started at Tue May 19 08:04:46 CST 2026'
+Launcher started at Tue May 19 08:04:46 CST 2026
++ echo 'PWD: /Users/sen'
+PWD: /Users/sen
++ echo 'PATH: /usr/bin:/bin:/usr/sbin:/sbin'
+PATH: /usr/bin:/bin:/usr/sbin:/sbin
++ echo 'SHELL: /bin/zsh'
+SHELL: /bin/zsh
++ source /Users/sen/KimiBackups/kimi_monitor_env/bin/activate
+++ '[' -z '' ']'
+++ '[' -n x ']'
+++ SCRIPT_PATH=/Users/sen/KimiBackups/kimi_monitor_env/bin/activate
+++ '[' /Users/sen/KimiBackups/kimi_monitor_env/bin/activate = /Applications/KimiMonitor.app/Contents/MacOS/KimiMonitor ']'
+++ deactivate nondestructive
+++ unset -f pydoc
+++ '[' -z '' ']'
+++ '[' -z '' ']'
+++ hash -r
+++ '[' -z '' ']'
+++ unset VIRTUAL_ENV
+++ unset VIRTUAL_ENV_PROMPT
+++ '[' '!' nondestructive = nondestructive ']'
+++ VIRTUAL_ENV=/Users/sen/KimiBackups/kimi_monitor_env
+++ '[' darwin25 = cygwin ']'
+++ '[' darwin25 = msys ']'
+++ export VIRTUAL_ENV
+++ '[' -z '' ']'
+++ unset SCRIPT_PATH
+++ _OLD_VIRTUAL_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+++ PATH=/Users/sen/KimiBackups/kimi_monitor_env/bin:/usr/bin:/bin:/usr/sbin:/sbin
+++ export PATH
+++ '[' x '!=' x ']'
++++ basename /Users/sen/KimiBackups/kimi_monitor_env
+++ VIRTUAL_ENV_PROMPT=kimi_monitor_env
+++ export VIRTUAL_ENV_PROMPT
+++ '[' -z '' ']'
+++ '[' -z '' ']'
+++ _OLD_VIRTUAL_PS1=
+++ PS1='(kimi_monitor_env) '
+++ export PS1
+++ alias pydoc
+++ true
+++ hash -r
++ echo 'Activated venv'
+Activated venv
++ which python3
+/Users/sen/KimiBackups/kimi_monitor_env/bin/python3
++ exec /Users/sen/KimiBackups/kimi_monitor_env/bin/python3 /Users/sen/KimiBackups/KimiMonitor/app.py

@@ -16,8 +16,9 @@ echo "========================================"
 echo ""
 
 # 检查环境
-if [ ! -d "kimi_monitor_env" ]; then
-    echo "❌ 错误: 虚拟环境不存在"
+VENV_DIR="../kimi_monitor_env"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "❌ 错误: 虚拟环境不存在于 $VENV_DIR"
     exit 1
 fi
 
@@ -28,7 +29,7 @@ mkdir -p dist
 
 # PyInstaller 打包
 echo "[2/5] PyInstaller 打包..."
-kimi_monitor_env/bin/python -m PyInstaller \
+$VENV_DIR/bin/python -m PyInstaller \
     --clean --noconfirm \
     KimiMonitor.spec
 

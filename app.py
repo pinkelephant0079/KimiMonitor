@@ -195,6 +195,13 @@ class KimiAPIClient:
         self._last_data: Optional[KimiUsageData] = None
         self._last_success_time = 0
         self._lock = threading.Lock()
+        # Token 刷新熔断
+        self._token_refresh_failures = 0
+        self._max_refresh_failures = 3
+        # API 失联熔断
+        self._consecutive_failures = 0
+        self._max_consecutive_failures = 3
+        self._silent_mode = False
 
     def _read_token(self) -> Optional[str]:
         if self._token:
@@ -207,6 +214,62 @@ class KimiAPIClient:
         except Exception as e:
             self._last_error = f"读取 token 失败: {e}"
             return None
+
+    def _refresh_token(self) -> bool:
+        """用 refresh_token 换取新 token，成功返回 True"""
+        if self._token_refresh_failures >= self._max_refresh_failures:
+            self._last_error = "Token 失效，请重新登录 Kimi CLI"
+            return False
+
+        try:
+            with open(TOKEN_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                refresh_token = data.get("refresh_token")
+                if not refresh_token:
+                    self._last_error = "无 refresh_token，请重新登录"
+                    self._token_refresh_failures = self._max_refresh_failures
+                    return False
+
+                resp = requests.post(
+                    "https://api.kimi.com/coding/v1/api/oauth/token",
+                    data={
+                        "client_id": "17e5f671-d194-4dfb-9706-5516cb48c098",
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                    },
+                    headers={"User-Agent": f"KimiMonitor/{VERSION}"},
+                    timeout=10,
+                )
+
+                if resp.status_code == 200:
+                    new_data = resp.json()
+                    data["access_token"] = new_data.get("access_token", "")
+                    data["refresh_token"] = new_data.get("refresh_token", data.get("refresh_token", ""))
+                    data["expires_at"] = new_data.get("expires_at", time.time() + 3600)
+                    data["expires_in"] = new_data.get("expires_in", 3600)
+                    with open(TOKEN_PATH, "w", encoding="utf-8") as f_out:
+                        json.dump(data, f_out, indent=2)
+                    self._token = data["access_token"]
+                    self._token_refresh_failures = 0
+                    self._consecutive_failures = 0
+                    self._silent_mode = False
+                    print("[Token] 自动刷新成功")
+                    return True
+                else:
+                    self._token_refresh_failures += 1
+                    if self._token_refresh_failures >= self._max_refresh_failures:
+                        self._last_error = "Token 失效，请重新登录 Kimi CLI"
+                    else:
+                        self._last_error = f"刷新失败 ({self._token_refresh_failures}/{self._max_refresh_failures})"
+                    return False
+
+        except Exception as e:
+            self._token_refresh_failures += 1
+            if self._token_refresh_failures >= self._max_refresh_failures:
+                self._last_error = "Token 失效，请重新登录 Kimi CLI"
+            else:
+                self._last_error = f"刷新失败: {e}"
+            return False
 
     def _read_device_id(self) -> str:
         if self._device_id:
@@ -244,6 +307,16 @@ class KimiAPIClient:
             return "未知", None
 
     def fetch(self) -> Optional[KimiUsageData]:
+        # 检查 token 是否快过期，提前刷新
+        try:
+            with open(TOKEN_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                expires_at = data.get("expires_at")
+                if expires_at and time.time() >= expires_at - 300:
+                    self._refresh_token()
+        except Exception:
+            pass
+
         token = self._read_token()
         if not token:
             return None
@@ -258,13 +331,39 @@ class KimiAPIClient:
         try:
             resp = requests.get(API_URL, headers=headers, timeout=(3, 10))
             if resp.status_code == 401:
-                self._last_error = "Token 已过期，请重新登录 Kimi CLI"
+                # Token 过期，尝试自动刷新一次
+                if self._refresh_token():
+                    token = self._read_token()
+                    headers["Authorization"] = f"Bearer {token}"
+                    resp = requests.get(API_URL, headers=headers, timeout=(3, 10))
+                    if resp.status_code == 200:
+                        payload = resp.json()
+                        data = self._parse_payload(payload)
+                        with self._lock:
+                            self._last_data = data
+                            self._last_success_time = time.time()
+                            self._last_error = None
+                            self._consecutive_failures = 0
+                        return data
+                # 刷新失败或重试仍失败
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self._max_consecutive_failures:
+                    self._silent_mode = True
+                    self._last_error = "失去连接"
                 return None
             elif resp.status_code == 429:
+                self._consecutive_failures += 1
                 self._last_error = "请求太频繁，被限流了"
+                if self._consecutive_failures >= self._max_consecutive_failures:
+                    self._silent_mode = True
+                    self._last_error = "失去连接"
                 return None
             elif resp.status_code != 200:
+                self._consecutive_failures += 1
                 self._last_error = f"API 错误: HTTP {resp.status_code}"
+                if self._consecutive_failures >= self._max_consecutive_failures:
+                    self._silent_mode = True
+                    self._last_error = "失去连接"
                 return None
 
             payload = resp.json()
@@ -273,14 +372,28 @@ class KimiAPIClient:
                 self._last_data = data
                 self._last_success_time = time.time()
                 self._last_error = None
+                self._consecutive_failures = 0
+                self._silent_mode = False
             return data
 
         except requests.Timeout:
+            self._consecutive_failures += 1
             self._last_error = "请求超时"
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                self._silent_mode = True
+                self._last_error = "失去连接"
         except requests.RequestException as e:
+            self._consecutive_failures += 1
             self._last_error = f"网络错误: {e}"
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                self._silent_mode = True
+                self._last_error = "失去连接"
         except Exception as e:
+            self._consecutive_failures += 1
             self._last_error = f"解析错误: {e}"
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                self._silent_mode = True
+                self._last_error = "失去连接"
         
         with self._lock:
             return self._last_data
@@ -501,18 +614,25 @@ class KimiMonitorApp(rumps.App):
                 print(f"[Worker Error] {e}")
 
     def _schedule_worker(self):
-        """后台线程：动态间隔自动刷新，低电量时延长到 3~4 分钟"""
+        """后台线程：动态间隔自动刷新，低电量/静默模式时延长间隔"""
         while self._running:
-            if PowerMonitor.is_low_power_mode():
+            if self.api._silent_mode:
+                interval = 300  # 静默模式 5 分钟
+                if not getattr(self, '_last_silent_logged', False):
+                    print(f"[Silent] 进入静默模式，刷新间隔延长至 {interval}s")
+                    self._last_silent_logged = True
+            elif PowerMonitor.is_low_power_mode():
                 interval = 180 + random.randint(0, 60)
                 if not getattr(self, '_last_low_power_logged', False):
                     print(f"[Power] 低电量模式，刷新间隔延长至 {interval}s")
                     self._last_low_power_logged = True
+                self._last_silent_logged = False
             else:
                 interval = 60 + random.randint(0, 10)
                 if getattr(self, '_last_low_power_logged', False):
                     print(f"[Power] 恢复正常模式，刷新间隔 {interval}s")
                     self._last_low_power_logged = False
+                self._last_silent_logged = False
             time.sleep(interval)
             if not self._sleeping and self._screen_active:
                 self._trigger_refresh()
@@ -603,6 +723,10 @@ class KimiMonitorApp(rumps.App):
 
     def on_refresh(self, _):
         """手动刷新"""
+        # 重置所有熔断计数器
+        self.api._consecutive_failures = 0
+        self.api._token_refresh_failures = 0
+        self.api._silent_mode = False
         self._set_title("⏳ 刷新中...")
         self._trigger_refresh()
 
@@ -755,6 +879,14 @@ class KimiMonitorApp(rumps.App):
             nsitem.setVisible_(True)
 
     def _update_title(self, data: Optional[KimiUsageData]):
+        # 熔断状态优先显示
+        if self.api._silent_mode and self.api._consecutive_failures >= 3:
+            self._set_title("⚠️ 失去连接")
+            return
+        if self.api._token_refresh_failures >= 3:
+            self._set_title("⚠️ Token 失效")
+            return
+
         if not data or not data.rate_limit:
             error = self.api.get_last_error()
             self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")

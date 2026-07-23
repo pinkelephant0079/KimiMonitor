@@ -1043,13 +1043,13 @@ class KimiMonitorApp(rumps.App):
                 err = self.api._work_error
                 self._set_title(f"⚠️ {err[:8]}" if err else "⚠️ --")
                 return
-            title = f"💼 {self._styled_text(work_info)}"
+            title = f"{self._icon_for(work_info.percent)} {self._styled_text(work_info)}"
         elif source == "both":
             parts = []
             if code_info:
-                parts.append(f"{self._icon_for(code_info.percent)} {code_info.percent}%")
+                parts.append(f"{self._icon_for(code_info.percent)} {self._styled_text(code_info)}")
             if work_info:
-                parts.append(f"💼 {work_info.percent}%")
+                parts.append(f"{self._icon_for(work_info.percent)} {self._styled_text(work_info)}")
             if not parts:
                 error = self.api.get_last_error() or self.api._work_error
                 self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")

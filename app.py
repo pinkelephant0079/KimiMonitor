@@ -34,10 +34,10 @@ from version import VERSION, VERSION_NAME, GITHUB_RELEASES_API, GITHUB_RELEASES_
 # ═══════════════════════════════════════════════════════════
 
 API_URL = "https://api.kimi.com/coding/v1/usages"
-WORK_API_URL = "https://agent-gw.kimi.com/coding/v1/usages"
+WORK_API_URL = "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription"
 APP_NAME = "KimiMonitor"
 TOKEN_PATH = Path.home() / ".kimi" / "credentials" / "kimi-code.json"
-WORK_KEY_PATH = Path.home() / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "kimi-code-key.json"
+WORK_KEY_PATH = Path.home() / "Library" / "Application Support" / "kimi-desktop" / "bridge-store" / "token-store.json"
 DEVICE_ID_PATH = Path.home() / ".kimi" / "device_id"
 CONFIG_PATH = Path.home() / ".kimi_monitor_app_config.json"
 SIGNAL_PATH = Path.home() / ".kimi_monitor_refresh_signal"
@@ -88,6 +88,7 @@ class KimiUsageData:
     weekly: Optional[UsageInfo]
     rate_limit: Optional[UsageInfo]
     work: Optional[UsageInfo] = None
+    work_gift: Optional[UsageInfo] = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -462,45 +463,60 @@ class KimiAPIClient:
 
         return KimiUsageData(weekly=weekly, rate_limit=rate_limit)
 
-    def fetch_work(self) -> Optional[UsageInfo]:
-        """拉取 Kimi Work 月度额度；key 文件不存在（未安装 Work）时静默返回 None"""
+    def fetch_work(self) -> tuple[Optional[UsageInfo], Optional[UsageInfo]]:
+        """拉取 Kimi Work 订阅主额度（GetSubscription），返回 (主额度, 赠送额度)；
+        桌面端凭证文件不存在（未安装/未登录）时静默返回 (None, None)"""
         if not WORK_KEY_PATH.exists():
-            return None
+            return None, None
         try:
             with open(WORK_KEY_PATH, "r", encoding="utf-8") as f:
-                api_key = json.load(f).get("apiKey")
-            if not api_key:
-                self._work_error = "key 无效"
-                return None
-            resp = requests.get(
+                token = json.load(f).get("tokens", {}).get("access_token")
+            if not token:
+                self._work_error = "凭证无效"
+                return None, None
+            resp = requests.post(
                 WORK_API_URL,
                 headers={
-                    "Authorization": f"Bearer {api_key}",
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
                     "User-Agent": f"KimiMonitor/{VERSION}",
                 },
+                json={},
                 timeout=(3, 10),
             )
             if resp.status_code in (401, 403):
-                # 静态 key 被轮换/作废：静默降级，不刷屏
+                # web token 失效（桌面端会自行刷新该文件，下一轮自动恢复）：静默降级
                 self._work_error = "授权失效"
-                return None
+                return None, None
             if resp.status_code != 200:
                 self._work_error = f"HTTP {resp.status_code}"
-                return None
-            quota = resp.json().get("totalQuota", {})
-            used, limit = self._parse_used(quota)
-            reset_text, reset_epoch = self._parse_reset_time(quota.get("resetTime", ""))
-            percent = min(int(used * 100 / limit), 100) if limit > 0 else 0
-            self._work_error = None
-            return UsageInfo(
-                label="Work 月度额度", used=used, limit=limit, percent=percent,
-                reset_text=reset_text, reset_epoch=reset_epoch,
-            )
+                return None, None
+
+            main_info = None
+            gift_info = None
+            for bal in resp.json().get("balances", []):
+                ratio = bal.get("amountUsedRatio")
+                if ratio is None:
+                    continue
+                percent = min(int(float(ratio) * 100 + 0.5), 100)
+                reset_text, reset_epoch = self._parse_reset_time(bal.get("expireTime", ""))
+                bal_type = bal.get("type")
+                label = "Work 月度额度" if bal_type == "SUBSCRIPTION" else "Work 赠送额度"
+                info = UsageInfo(
+                    label=label, used=percent, limit=100, percent=percent,
+                    reset_text=reset_text, reset_epoch=reset_epoch,
+                )
+                if bal_type == "SUBSCRIPTION":
+                    main_info = info
+                elif bal_type == "GIFT":
+                    gift_info = info
+            self._work_error = None if main_info else "无订阅额度"
+            return main_info, gift_info
         except requests.Timeout:
             self._work_error = "请求超时"
         except Exception as e:
             self._work_error = f"{e}"
-        return None
+        return None, None
 
     def get_last_error(self) -> Optional[str]:
         return self._last_error
@@ -575,6 +591,7 @@ class KimiMonitorApp(rumps.App):
         self.menu.add(rumps.MenuItem("📊 CLI 周调用配额"))
         self.menu.add(rumps.MenuItem("📊 5分钟频限"))
         self.menu.add(rumps.MenuItem("📊 Work 月度额度"))
+        self.menu.add(rumps.MenuItem("🎁 Work 赠送额度"))
         self.menu.add(None)
         self.menu.add(rumps.MenuItem("🔄 立即刷新", callback=self.on_refresh))
         self.menu.add(None)
@@ -683,11 +700,12 @@ class KimiMonitorApp(rumps.App):
                 msg = self._result_queue.get(timeout=1)
                 if msg == "refresh":
                     data = self.api.fetch()
-                    work = self.api.fetch_work()
-                    if data is None and work is not None:
-                        data = KimiUsageData(weekly=None, rate_limit=None, work=work)
-                    elif data is not None:
+                    work, work_gift = self.api.fetch_work()
+                    if data is None and (work or work_gift):
+                        data = KimiUsageData(weekly=None, rate_limit=None)
+                    if data is not None:
                         data.work = work
+                        data.work_gift = work_gift
                     # 等待 rumps.App.run() 初始化 _nsapp 并进入事件循环
                     while self._running and (not hasattr(self, '_nsapp') or self._nsapp is None):
                         time.sleep(0.1)
@@ -1062,16 +1080,21 @@ class KimiMonitorApp(rumps.App):
             error = self.api.get_last_error()
             self.menu["📊 5分钟频限"].title = f"📊 5分钟频限: {error or '--'}"
 
-        # 未安装 Kimi Work（无 key 文件）时整行隐藏
+        # 未安装 Kimi Work（无凭证文件）时整行隐藏
         try:
-            self.menu["📊 Work 月度额度"]._menuitem.setHidden_(not WORK_KEY_PATH.exists())
+            hidden = not WORK_KEY_PATH.exists()
+            self.menu["📊 Work 月度额度"]._menuitem.setHidden_(hidden)
+            self.menu["🎁 Work 赠送额度"]._menuitem.setHidden_(hidden or not (data and data.work_gift))
         except Exception:
             pass
         if data and data.work:
             w = data.work
-            self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {w.used}/{w.limit} ({w.percent}%) · {w.reset_text}"
+            self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {w.percent}% · {w.reset_text}"
         else:
             self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {self.api._work_error or '--'}"
+        if data and data.work_gift:
+            g = data.work_gift
+            self.menu["🎁 Work 赠送额度"].title = f"🎁 Work 赠送额度: {g.percent}% · {g.reset_text}"
 
         source = self.config.get("menubar_source", "code")
         for key, item in self._menubar_items.items():

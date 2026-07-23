@@ -446,7 +446,7 @@ class KimiAPIClient:
             reset_text, reset_epoch = self._parse_reset_time(reset_str)
             percent = min(int(used * 100 / limit), 100) if limit > 0 else 0
             rate_limit = UsageInfo(
-                label="5分钟频限", used=used, limit=limit, percent=percent,
+                label="5小时频限", used=used, limit=limit, percent=percent,
                 reset_text=reset_text, reset_epoch=reset_epoch,
             )
 
@@ -572,7 +572,7 @@ class KimiMonitorApp(rumps.App):
         """构建下拉菜单"""
         self.menu.clear()
         self.menu.add(rumps.MenuItem("📊 CLI 周调用配额"))
-        self.menu.add(rumps.MenuItem("📊 5分钟频限"))
+        self.menu.add(rumps.MenuItem("📊 5小时频限"))
         self.menu.add(rumps.MenuItem("📊 Work 月度额度"))
         self.menu.add(rumps.MenuItem("🎁 Work 赠送额度"))
         self.menu.add(None)
@@ -969,10 +969,10 @@ class KimiMonitorApp(rumps.App):
 
         if data and data.rate_limit:
             rl = data.rate_limit
-            self.menu["📊 5分钟频限"].title = f"📊 5分钟频限: {rl.used}/{rl.limit} ({rl.percent}%) · {rl.reset_text}"
+            self.menu["📊 5小时频限"].title = f"📊 5小时频限: {rl.used}/{rl.limit} ({rl.percent}%) · {rl.reset_text}"
         else:
             error = self.api.get_last_error()
-            self.menu["📊 5分钟频限"].title = f"📊 5分钟频限: {error or '--'}"
+            self.menu["📊 5小时频限"].title = f"📊 5小时频限: {error or '--'}"
 
         # 未安装 Kimi Work（无凭证文件）时整行隐藏
         try:

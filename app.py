@@ -582,6 +582,7 @@ class KimiMonitorApp(rumps.App):
         style_menu = rumps.MenuItem("⚙️ 显示风格")
         self._style_items["percent"] = rumps.MenuItem("百分比", callback=lambda _: self.set_style("percent"))
         self._style_items["percent_countdown"] = rumps.MenuItem("百分比+倒计时", callback=lambda _: self.set_style("percent_countdown"))
+        self._style_items["remaining"] = rumps.MenuItem("剩余", callback=lambda _: self.set_style("remaining"))
         self._style_items["remaining_countdown"] = rumps.MenuItem("剩余+倒计时", callback=lambda _: self.set_style("remaining_countdown"))
         self._style_items["progress"] = rumps.MenuItem("进度条", callback=lambda _: self.set_style("progress"))
         for item in self._style_items.values():
@@ -906,6 +907,8 @@ class KimiMonitorApp(rumps.App):
             if info.reset_text and info.reset_text != "已重置":
                 return f"{info.percent}% · {info.reset_text}"
             return f"{info.percent}%"
+        if style == "remaining":
+            return f"剩{max(0, 100 - info.percent)}%"
         if style == "remaining_countdown":
             remaining = max(0, 100 - info.percent)
             if info.reset_text and info.reset_text != "已重置":

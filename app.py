@@ -44,9 +44,6 @@ SIGNAL_PATH = Path.home() / ".kimi_monitor_refresh_signal"
 
 DEFAULT_CONFIG = {
     "style": "percent_countdown",
-    "icon_theme": "default",
-    "warn_threshold": 50,      # 正常→告急 边界
-    "critical_threshold": 80,  # 告急→警惕 边界
     "refresh_interval": 60,
     "idle_threshold": 300,  # 5分钟空闲认为屏幕无人
     "menubar_source": "code",  # 菜单栏显示: code / work / both
@@ -57,16 +54,8 @@ DEFAULT_CONFIG = {
     },
 }
 
-# 4 状态图标：normal / warning / critical / exhausted
-ICON_THEMES = {
-    "default":     {"normal": "⚪", "warning": "🟡", "critical": "🔴", "exhausted": "⚫"},
-    "heart":       {"normal": "🤍", "warning": "💛", "critical": "❤️", "exhausted": "🖤"},
-    "fire":        {"normal": "❄️", "warning": "💧", "critical": "🔥", "exhausted": "💀"},
-    "diamond":     {"normal": "💎", "warning": "💠", "critical": "🔺", "exhausted": "⚫"},
-    "traffic":     {"normal": "🟢", "warning": "🟡", "critical": "🔴", "exhausted": "⛔"},
-    "moon":        {"normal": "🌑", "warning": "🌗", "critical": "🌕", "exhausted": "☀️"},
-    "battery":     {"normal": "🔋", "warning": "⚡️", "critical": "🪫", "exhausted": "❌"},
-}
+# 月相图标：8 相盈亏周期，暗合月之暗面
+MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -551,8 +540,6 @@ class KimiMonitorApp(rumps.App):
         self._result_queue = queue.Queue()
         self._ui_updater = UIUpdater.alloc().initWithApp_(self)
         self._style_items = {}
-        self._theme_items = {}
-        self._threshold_items = {}
         self._menubar_items = {}
         self._running = True
         
@@ -577,11 +564,7 @@ class KimiMonitorApp(rumps.App):
         
         self._screen_thread = threading.Thread(target=self._screen_monitor_worker, daemon=True)
         self._screen_thread.start()
-        
-        # 修正旧配置：警惕阈值不应超过 90（100% 是耗尽状态）
-        if self.config.get("critical_threshold", 80) > 90:
-            self.config.set("critical_threshold", 90)
-        
+
         # 立即触发第一次刷新
         self._trigger_refresh()
 
@@ -604,23 +587,6 @@ class KimiMonitorApp(rumps.App):
         for item in self._style_items.values():
             style_menu.add(item)
         self.menu.add(style_menu)
-        
-        theme_menu = rumps.MenuItem("🎨 图标主题")
-        warn_th = self.config.get("warn_threshold", 50)
-        crit_th = self.config.get("critical_threshold", 80)
-        theme_labels = {
-            "default":  f"默认    ⚪(<{warn_th}%) 🟡(≥{warn_th}%) 🔴(≥{crit_th}%) ⚫(100%)",
-            "heart":    f"爱心    🤍(<{warn_th}%) 💛(≥{warn_th}%) ❤️(≥{crit_th}%) 🖤(100%)",
-            "fire":     f"冰火    ❄️(<{warn_th}%) 💧(≥{warn_th}%) 🔥(≥{crit_th}%) 💀(100%)",
-            "diamond":  f"钻石    💎(<{warn_th}%) 💠(≥{warn_th}%) 🔺(≥{crit_th}%) ⚫(100%)",
-            "traffic":  f"交通    🟢(<{warn_th}%) 🟡(≥{warn_th}%) 🔴(≥{crit_th}%) ⛔(100%)",
-            "moon":     f"月相    🌑(<{warn_th}%) 🌗(≥{warn_th}%) 🌕(≥{crit_th}%) ☀️(100%)",
-            "battery":  f"电池    🔋(<{warn_th}%) ⚡️(≥{warn_th}%) 🪫(≥{crit_th}%) ❌(100%)",
-        }
-        for key, label in theme_labels.items():
-            self._theme_items[key] = rumps.MenuItem(label, callback=lambda _, k=key: self.set_icon_theme(k))
-            theme_menu.add(self._theme_items[key])
-        self.menu.add(theme_menu)
 
         # 菜单栏显示来源：仅 Code / 仅 Work / 双显
         menubar_menu = rumps.MenuItem("🖥 菜单栏显示")
@@ -628,42 +594,7 @@ class KimiMonitorApp(rumps.App):
             self._menubar_items[key] = rumps.MenuItem(label, callback=lambda _, k=key: self.set_menubar_source(k))
             menubar_menu.add(self._menubar_items[key])
         self.menu.add(menubar_menu)
-        
-        # 阈值设置（滑块 + 刻度 + 轨道色）
-        threshold_menu = rumps.MenuItem("⚠️ 阈值设置")
-        warn_th = self.config.get("warn_threshold", 50)
-        crit_th = self.config.get("critical_threshold", 80)
-        self._threshold_items["warn_label"] = rumps.MenuItem("告急阈值", callback=lambda _: None)
-        self._threshold_items["warn_label"].title = f"告急阈值: {warn_th}%"
-        threshold_menu.add(self._threshold_items["warn_label"])
-        self._warn_slider = rumps.SliderMenuItem(
-            value=warn_th, min_value=10, max_value=90,
-            callback=self._on_warn_slider_change,
-            dimensions=(180, 22)
-        )
-        # 9 个刻度（10% 步进），只允许停在刻度上
-        self._warn_slider._slider.setNumberOfTickMarks_(9)
-        self._warn_slider._slider.setAllowsTickMarkValuesOnly_(True)
-        # 轨道颜色：橙色（与告急状态呼应）
-        from AppKit import NSColor
-        self._warn_slider._slider.setTrackFillColor_(NSColor.systemOrangeColor())
-        threshold_menu.add(self._warn_slider)
-        threshold_menu.add(None)
-        self._threshold_items["crit_label"] = rumps.MenuItem("警惕阈值", callback=lambda _: None)
-        self._threshold_items["crit_label"].title = f"警惕阈值: {crit_th}%"
-        threshold_menu.add(self._threshold_items["crit_label"])
-        self._crit_slider = rumps.SliderMenuItem(
-            value=min(crit_th, 90), min_value=20, max_value=90,
-            callback=self._on_crit_slider_change,
-            dimensions=(180, 22)
-        )
-        self._crit_slider._slider.setNumberOfTickMarks_(9)
-        self._crit_slider._slider.setAllowsTickMarkValuesOnly_(True)
-        # 轨道颜色：红色（与警惕状态呼应）
-        self._crit_slider._slider.setTrackFillColor_(NSColor.systemRedColor())
-        threshold_menu.add(self._crit_slider)
-        self.menu.add(threshold_menu)
-        
+
         self.menu.add(None)
         self.menu.add(rumps.MenuItem("📋 打开开发日志", callback=self.on_open_log))
         self.menu.add(None)
@@ -839,35 +770,9 @@ class KimiMonitorApp(rumps.App):
         self.config.set("style", style)
         self._update_ui(self.api._last_data)
 
-    def set_icon_theme(self, theme: str):
-        self.config.set("icon_theme", theme)
-        self._update_ui(self.api._last_data)
-
     def set_menubar_source(self, source: str):
         self.config.set("menubar_source", source)
         self._update_ui(self.api._last_data)
-
-    def _on_warn_slider_change(self, slider):
-        """告急阈值滑块变化回调"""
-        new_val = int(slider.value)
-        crit = self.config.get("critical_threshold", 80)
-        if new_val >= crit:
-            new_val = max(10, crit - 10)
-            slider.value = new_val
-        self.config.set("warn_threshold", new_val)
-        self._threshold_items["warn_label"].title = f"告急阈值: {new_val}%"
-        self._update_title(self.api._last_data)
-    
-    def _on_crit_slider_change(self, slider):
-        """警惕阈值滑块变化回调"""
-        new_val = int(slider.value)
-        warn = self.config.get("warn_threshold", 50)
-        if new_val <= warn:
-            new_val = min(90, warn + 10)
-            slider.value = new_val
-        self.config.set("critical_threshold", new_val)
-        self._threshold_items["crit_label"].title = f"警惕阈值: {new_val}%"
-        self._update_title(self.api._last_data)
 
     def on_open_log(self, _):
         log_path = Path.home() / "KimiBackups" / "devlogs" / "KimiMonitor_DevLog.md"
@@ -987,23 +892,10 @@ class KimiMonitorApp(rumps.App):
         if hasattr(nsitem, 'setVisible_'):
             nsitem.setVisible_(True)
 
-    def _icon_for(self, percent: int) -> str:
-        """按当前主题和阈值返回状态图标"""
-        theme_key = self.config.get("icon_theme", "default")
-        theme = ICON_THEMES.get(theme_key, ICON_THEMES["default"])
-        warn_th = self.config.get("warn_threshold", 50)
-        crit_th = self.config.get("critical_threshold", 80)
-        if theme_key == "moon":
-            # 彩蛋：8 月相盈亏周期，暗合月之暗面
-            moon_phases = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
-            return moon_phases[min(7, int(percent * 8 / 100))]
-        if percent >= 100:
-            return theme["exhausted"]
-        if percent >= crit_th:
-            return theme["critical"]
-        if percent >= warn_th:
-            return theme["warning"]
-        return theme["normal"]
+    @staticmethod
+    def _icon_for(percent: int) -> str:
+        """月相图标：随百分比盈亏"""
+        return MOON_PHASES[min(7, int(percent * 8 / 100))]
 
     def _styled_text(self, info: UsageInfo) -> str:
         """按当前显示风格格式化一条额度数据（不含图标）"""
@@ -1047,14 +939,16 @@ class KimiMonitorApp(rumps.App):
         elif source == "both":
             parts = []
             if code_info:
-                parts.append(f"{self._icon_for(code_info.percent)} {self._styled_text(code_info)}")
+                parts.append(self._styled_text(code_info))
             if work_info:
-                parts.append(f"{self._icon_for(work_info.percent)} {self._styled_text(work_info)}")
+                parts.append(self._styled_text(work_info))
             if not parts:
                 error = self.api.get_last_error() or self.api._work_error
                 self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")
                 return
-            title = " · ".join(parts)
+            # Code 和 Work 共用额度池：只显示一个月相，跟随 Work 主额度
+            icon_source = work_info or code_info
+            title = f"{self._icon_for(icon_source.percent)} " + " · ".join(parts)
         else:
             if not code_info:
                 error = self.api.get_last_error()
@@ -1103,15 +997,6 @@ class KimiMonitorApp(rumps.App):
         style = self.config.get("style", "percent_countdown")
         for key, item in self._style_items.items():
             item.state = 1 if key == style else 0
-        
-        theme = self.config.get("icon_theme", "default")
-        for key, item in self._theme_items.items():
-            item.state = 1 if key == theme else 0
-        
-        warn_th = self.config.get("warn_threshold", 50)
-        crit_th = self.config.get("critical_threshold", 80)
-        self._threshold_items["warn_label"].title = f"告急阈值: {warn_th}%"
-        self._threshold_items["crit_label"].title = f"警惕阈值: {crit_th}%"
 
     def _progress_bar(self, percent: int, width: int = 10) -> str:
         filled = percent * width // 100

@@ -34,8 +34,10 @@ from version import VERSION, VERSION_NAME, GITHUB_RELEASES_API, GITHUB_RELEASES_
 # ═══════════════════════════════════════════════════════════
 
 API_URL = "https://api.kimi.com/coding/v1/usages"
+WORK_API_URL = "https://agent-gw.kimi.com/coding/v1/usages"
 APP_NAME = "KimiMonitor"
 TOKEN_PATH = Path.home() / ".kimi" / "credentials" / "kimi-code.json"
+WORK_KEY_PATH = Path.home() / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "kimi-code-key.json"
 DEVICE_ID_PATH = Path.home() / ".kimi" / "device_id"
 CONFIG_PATH = Path.home() / ".kimi_monitor_app_config.json"
 SIGNAL_PATH = Path.home() / ".kimi_monitor_refresh_signal"
@@ -47,6 +49,7 @@ DEFAULT_CONFIG = {
     "critical_threshold": 80,  # 告急→警惕 边界
     "refresh_interval": 60,
     "idle_threshold": 300,  # 5分钟空闲认为屏幕无人
+    "menubar_source": "code",  # 菜单栏显示: code / work / both
     "colors": {
         "normal": "#FFFFFF",
         "warning": "#FF9500",
@@ -84,6 +87,7 @@ class UsageInfo:
 class KimiUsageData:
     weekly: Optional[UsageInfo]
     rate_limit: Optional[UsageInfo]
+    work: Optional[UsageInfo] = None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -202,6 +206,8 @@ class KimiAPIClient:
         self._consecutive_failures = 0
         self._max_consecutive_failures = 3
         self._silent_mode = False
+        # Work 额度错误状态（与 Code 独立容错）
+        self._work_error = None
 
     def _read_token(self) -> Optional[str]:
         if self._token:
@@ -307,6 +313,12 @@ class KimiAPIClient:
                 return "已重置", None
             hours = seconds // 3600
             mins = (seconds % 3600) // 60
+            if hours >= 24:
+                days = hours // 24
+                rem = hours % 24
+                if rem > 0:
+                    return f"{days}天{rem}小时后", dt.timestamp()
+                return f"{days}天后", dt.timestamp()
             if hours > 0:
                 if mins > 0:
                     return f"{hours}h{mins}m后", dt.timestamp()
@@ -410,36 +422,85 @@ class KimiAPIClient:
         with self._lock:
             return self._last_data
 
+    @staticmethod
+    def _parse_used(detail: dict) -> tuple[int, int]:
+        """兼容 used / remaining 两种返回字段（接口字段为字符串数字），返回 (used, limit)"""
+        limit = int(detail.get("limit", 0) or 0)
+        used_raw = detail.get("used")
+        if used_raw is not None:
+            used = int(used_raw or 0)
+        else:
+            used = max(0, limit - int(detail.get("remaining", 0) or 0))
+        return used, limit
+
     def _parse_payload(self, payload: dict) -> KimiUsageData:
         weekly = None
         rate_limit = None
 
         usage = payload.get("usage")
         if isinstance(usage, dict):
-            limit = int(usage.get("limit", 0) or 0)
-            used = int(usage.get("used", 0) or 0)
+            used, limit = self._parse_used(usage)
             reset_str = usage.get("resetTime", "")
             reset_text, reset_epoch = self._parse_reset_time(reset_str)
             percent = min(int(used * 100 / limit), 100) if limit > 0 else 0
             weekly = UsageInfo(
-                label="本周用量", used=used, limit=limit, percent=percent,
+                label="CLI 周调用配额", used=used, limit=limit, percent=percent,
                 reset_text=reset_text, reset_epoch=reset_epoch,
             )
 
         limits = payload.get("limits", [])
         if limits and isinstance(limits[0], dict):
             detail = limits[0].get("detail", {})
-            limit = int(detail.get("limit", 0) or 0)
-            used = int(detail.get("used", 0) or 0)
+            used, limit = self._parse_used(detail)
             reset_str = detail.get("resetTime", "")
             reset_text, reset_epoch = self._parse_reset_time(reset_str)
             percent = min(int(used * 100 / limit), 100) if limit > 0 else 0
             rate_limit = UsageInfo(
-                label="频限明细", used=used, limit=limit, percent=percent,
+                label="5分钟频限", used=used, limit=limit, percent=percent,
                 reset_text=reset_text, reset_epoch=reset_epoch,
             )
 
         return KimiUsageData(weekly=weekly, rate_limit=rate_limit)
+
+    def fetch_work(self) -> Optional[UsageInfo]:
+        """拉取 Kimi Work 月度额度；key 文件不存在（未安装 Work）时静默返回 None"""
+        if not WORK_KEY_PATH.exists():
+            return None
+        try:
+            with open(WORK_KEY_PATH, "r", encoding="utf-8") as f:
+                api_key = json.load(f).get("apiKey")
+            if not api_key:
+                self._work_error = "key 无效"
+                return None
+            resp = requests.get(
+                WORK_API_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": f"KimiMonitor/{VERSION}",
+                },
+                timeout=(3, 10),
+            )
+            if resp.status_code in (401, 403):
+                # 静态 key 被轮换/作废：静默降级，不刷屏
+                self._work_error = "授权失效"
+                return None
+            if resp.status_code != 200:
+                self._work_error = f"HTTP {resp.status_code}"
+                return None
+            quota = resp.json().get("totalQuota", {})
+            used, limit = self._parse_used(quota)
+            reset_text, reset_epoch = self._parse_reset_time(quota.get("resetTime", ""))
+            percent = min(int(used * 100 / limit), 100) if limit > 0 else 0
+            self._work_error = None
+            return UsageInfo(
+                label="Work 月度额度", used=used, limit=limit, percent=percent,
+                reset_text=reset_text, reset_epoch=reset_epoch,
+            )
+        except requests.Timeout:
+            self._work_error = "请求超时"
+        except Exception as e:
+            self._work_error = f"{e}"
+        return None
 
     def get_last_error(self) -> Optional[str]:
         return self._last_error
@@ -476,6 +537,7 @@ class KimiMonitorApp(rumps.App):
         self._style_items = {}
         self._theme_items = {}
         self._threshold_items = {}
+        self._menubar_items = {}
         self._running = True
         
         # 智能刷新状态
@@ -510,8 +572,9 @@ class KimiMonitorApp(rumps.App):
     def _build_menu(self):
         """构建下拉菜单"""
         self.menu.clear()
-        self.menu.add(rumps.MenuItem("📊 本周用量"))
-        self.menu.add(rumps.MenuItem("📊 频限明细"))
+        self.menu.add(rumps.MenuItem("📊 CLI 周调用配额"))
+        self.menu.add(rumps.MenuItem("📊 5分钟频限"))
+        self.menu.add(rumps.MenuItem("📊 Work 月度额度"))
         self.menu.add(None)
         self.menu.add(rumps.MenuItem("🔄 立即刷新", callback=self.on_refresh))
         self.menu.add(None)
@@ -541,6 +604,13 @@ class KimiMonitorApp(rumps.App):
             self._theme_items[key] = rumps.MenuItem(label, callback=lambda _, k=key: self.set_icon_theme(k))
             theme_menu.add(self._theme_items[key])
         self.menu.add(theme_menu)
+
+        # 菜单栏显示来源：仅 Code / 仅 Work / 双显
+        menubar_menu = rumps.MenuItem("🖥 菜单栏显示")
+        for key, label in [("code", "仅 Code 频限"), ("work", "仅 Work 额度"), ("both", "Code + Work 双显")]:
+            self._menubar_items[key] = rumps.MenuItem(label, callback=lambda _, k=key: self.set_menubar_source(k))
+            menubar_menu.add(self._menubar_items[key])
+        self.menu.add(menubar_menu)
         
         # 阈值设置（滑块 + 刻度 + 轨道色）
         threshold_menu = rumps.MenuItem("⚠️ 阈值设置")
@@ -613,6 +683,11 @@ class KimiMonitorApp(rumps.App):
                 msg = self._result_queue.get(timeout=1)
                 if msg == "refresh":
                     data = self.api.fetch()
+                    work = self.api.fetch_work()
+                    if data is None and work is not None:
+                        data = KimiUsageData(weekly=None, rate_limit=None, work=work)
+                    elif data is not None:
+                        data.work = work
                     # 等待 rumps.App.run() 初始化 _nsapp 并进入事件循环
                     while self._running and (not hasattr(self, '_nsapp') or self._nsapp is None):
                         time.sleep(0.1)
@@ -750,6 +825,10 @@ class KimiMonitorApp(rumps.App):
         self.config.set("icon_theme", theme)
         self._update_ui(self.api._last_data)
 
+    def set_menubar_source(self, source: str):
+        self.config.set("menubar_source", source)
+        self._update_ui(self.api._last_data)
+
     def _on_warn_slider_change(self, slider):
         """告急阈值滑块变化回调"""
         new_val = int(slider.value)
@@ -773,7 +852,7 @@ class KimiMonitorApp(rumps.App):
         self._update_title(self.api._last_data)
 
     def on_open_log(self, _):
-        log_path = Path.home() / "KimiBackups" / "KimiMonitor_DevLog.md"
+        log_path = Path.home() / "KimiBackups" / "devlogs" / "KimiMonitor_DevLog.md"
         os.system(f'open "{log_path}"')
 
     def on_about(self, _):
@@ -890,56 +969,81 @@ class KimiMonitorApp(rumps.App):
         if hasattr(nsitem, 'setVisible_'):
             nsitem.setVisible_(True)
 
-    def _update_title(self, data: Optional[KimiUsageData]):
-        # 熔断状态优先显示
-        if self.api._silent_mode and self.api._consecutive_failures >= 3:
-            self._set_title("⚠️ 失去连接")
-            return
-        if self.api._token_refresh_failures >= 3:
-            self._set_title("⚠️ Token 失效")
-            return
-
-        if not data or not data.rate_limit:
-            error = self.api.get_last_error()
-            self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")
-            return
-
-        rl = data.rate_limit
-        style = self.config.get("style", "percent_countdown")
-        
+    def _icon_for(self, percent: int) -> str:
+        """按当前主题和阈值返回状态图标"""
         theme_key = self.config.get("icon_theme", "default")
         theme = ICON_THEMES.get(theme_key, ICON_THEMES["default"])
         warn_th = self.config.get("warn_threshold", 50)
         crit_th = self.config.get("critical_threshold", 80)
-        
-        if rl.percent >= 100:
-            icon = theme["exhausted"]
-        elif rl.percent >= crit_th:
-            icon = theme["critical"]
-        elif rl.percent >= warn_th:
-            icon = theme["warning"]
-        else:
-            icon = theme["normal"]
-        
+        if theme_key == "moon":
+            # 彩蛋：8 月相盈亏周期，暗合月之暗面
+            moon_phases = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
+            return moon_phases[min(7, int(percent * 8 / 100))]
+        if percent >= 100:
+            return theme["exhausted"]
+        if percent >= crit_th:
+            return theme["critical"]
+        if percent >= warn_th:
+            return theme["warning"]
+        return theme["normal"]
+
+    def _styled_text(self, info: UsageInfo) -> str:
+        """按当前显示风格格式化一条额度数据（不含图标）"""
+        style = self.config.get("style", "percent_countdown")
         if style == "percent":
-            title = f"{icon} {rl.percent}%"
-        elif style == "percent_countdown":
-            if rl.reset_text and rl.reset_text != "已重置":
-                title = f"{icon} {rl.percent}% · {rl.reset_text}"
-            else:
-                title = f"{icon} {rl.percent}%"
-        elif style == "remaining_countdown":
-            remaining = max(0, 100 - rl.percent)
-            if rl.reset_text and rl.reset_text != "已重置":
-                title = f"{icon} 剩{remaining}% · {rl.reset_text}"
-            else:
-                title = f"{icon} 剩{remaining}%"
-        elif style == "progress":
-            bar = self._progress_bar(rl.percent)
-            title = f"{icon} {bar}"
+            return f"{info.percent}%"
+        if style == "percent_countdown":
+            if info.reset_text and info.reset_text != "已重置":
+                return f"{info.percent}% · {info.reset_text}"
+            return f"{info.percent}%"
+        if style == "remaining_countdown":
+            remaining = max(0, 100 - info.percent)
+            if info.reset_text and info.reset_text != "已重置":
+                return f"剩{remaining}% · {info.reset_text}"
+            return f"剩{remaining}%"
+        if style == "progress":
+            return self._progress_bar(info.percent)
+        return f"{info.percent}%"
+
+    def _update_title(self, data: Optional[KimiUsageData]):
+        source = self.config.get("menubar_source", "code")
+
+        # 熔断状态优先显示（仅 Code 来源时）
+        if source == "code":
+            if self.api._silent_mode and self.api._consecutive_failures >= 3:
+                self._set_title("⚠️ 失去连接")
+                return
+            if self.api._token_refresh_failures >= 3:
+                self._set_title("⚠️ Token 失效")
+                return
+
+        code_info = data.rate_limit if data else None
+        work_info = data.work if data else None
+
+        if source == "work":
+            if not work_info:
+                err = self.api._work_error
+                self._set_title(f"⚠️ {err[:8]}" if err else "⚠️ --")
+                return
+            title = f"💼 {self._styled_text(work_info)}"
+        elif source == "both":
+            parts = []
+            if code_info:
+                parts.append(f"{self._icon_for(code_info.percent)} {code_info.percent}%")
+            if work_info:
+                parts.append(f"💼 {work_info.percent}%")
+            if not parts:
+                error = self.api.get_last_error() or self.api._work_error
+                self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")
+                return
+            title = " · ".join(parts)
         else:
-            title = f"{icon} {rl.percent}%"
-        
+            if not code_info:
+                error = self.api.get_last_error()
+                self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")
+                return
+            title = f"{self._icon_for(code_info.percent)} {self._styled_text(code_info)}"
+
         # 低电量模式：标题变为黄色
         color = "yellow" if PowerMonitor.is_low_power_mode() else None
         self._set_title(title, color)
@@ -947,16 +1051,31 @@ class KimiMonitorApp(rumps.App):
     def _update_menu(self, data: Optional[KimiUsageData]):
         if data and data.weekly:
             w = data.weekly
-            self.menu["📊 本周用量"].title = f"📊 本周用量: {w.used}/{w.limit} ({w.percent}%) · {w.reset_text}"
+            self.menu["📊 CLI 周调用配额"].title = f"📊 CLI 周调用配额: {w.used}/{w.limit} ({w.percent}%) · {w.reset_text}"
         else:
-            self.menu["📊 本周用量"].title = "📊 本周用量: --"
+            self.menu["📊 CLI 周调用配额"].title = "📊 CLI 周调用配额: --"
 
         if data and data.rate_limit:
             rl = data.rate_limit
-            self.menu["📊 频限明细"].title = f"📊 频限明细: {rl.used}/{rl.limit} ({rl.percent}%) · {rl.reset_text}"
+            self.menu["📊 5分钟频限"].title = f"📊 5分钟频限: {rl.used}/{rl.limit} ({rl.percent}%) · {rl.reset_text}"
         else:
             error = self.api.get_last_error()
-            self.menu["📊 频限明细"].title = f"📊 频限明细: {error or '--'}"
+            self.menu["📊 5分钟频限"].title = f"📊 5分钟频限: {error or '--'}"
+
+        # 未安装 Kimi Work（无 key 文件）时整行隐藏
+        try:
+            self.menu["📊 Work 月度额度"]._menuitem.setHidden_(not WORK_KEY_PATH.exists())
+        except Exception:
+            pass
+        if data and data.work:
+            w = data.work
+            self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {w.used}/{w.limit} ({w.percent}%) · {w.reset_text}"
+        else:
+            self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {self.api._work_error or '--'}"
+
+        source = self.config.get("menubar_source", "code")
+        for key, item in self._menubar_items.items():
+            item.state = 1 if key == source else 0
 
         style = self.config.get("style", "percent_countdown")
         for key, item in self._style_items.items():

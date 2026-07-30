@@ -54,8 +54,8 @@ DEFAULT_CONFIG = {
     },
 }
 
-# 月相图标：8 相盈亏周期，暗合月之暗面
-MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"]
+# 月相图标：5 相渐盈铺满 0-100%，额度用满即满月（暗合月之暗面）
+MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕"]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -895,8 +895,8 @@ class KimiMonitorApp(rumps.App):
 
     @staticmethod
     def _icon_for(percent: int) -> str:
-        """月相图标：随百分比盈亏"""
-        return MOON_PHASES[min(7, int(percent * 8 / 100))]
+        """月相图标：5 相渐盈，100% 为满月"""
+        return MOON_PHASES[min(4, int(percent * 5 / 100))]
 
     def _styled_text(self, info: UsageInfo) -> str:
         """按当前显示风格格式化一条额度数据（不含图标）"""

@@ -26,7 +26,7 @@ macOS 菜单栏应用，实时监控 Kimi 额度，不用开网页就能看用�
 | Work API | `~/Library/Application Support/kimi-desktop/bridge-store/token-store.json` → `tokens.access_token` | web token，**桌面端自行刷新该文件，App 只读不写** |
 | ⚠️ 陷阱 | `agent-gw.kimi.com/coding/v1/usages` + `daimon-share/daimon/kimi-code-key.json` | 返回的 `totalQuota` 是**赠送池**，不是主额度！v1.1.0 踩过这个坑，v1.1.1 已纠正 |
 
-菜单栏图标：固定月相（8 相盈亏随百分比）。双显模式只显示一个月相，按 Code + Work 百分比之和（封顶 100%），两者共用额度池。
+菜单栏图标：月相 5 相渐盈（0-19 🌑 / 20-39 🌒 / 40-59 🌓 / 60-79 🌔 / 80-100 🌕，用满即满月）。双显模式只显示一个月相，按 Code + Work 百分比之和（封顶 100%），两者共用额度池。
 
 ---
 

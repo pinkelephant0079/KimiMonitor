@@ -77,8 +77,8 @@ GH_TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill | 
 
 ## 发版状态
 
-- 本地：`v1.2.2`（已部署运行中）
-- GitHub Release：`v1.2.0`，**落后本地 2 个版本**（v1.2.1、v1.2.2 攒着下次一起推）
+- 本地：`v1.2.4`（已部署运行中）
+- GitHub Release：`v1.2.4`，与本地同步
 
 ---
 
@@ -125,6 +125,6 @@ GH_TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill | 
 
 ## 版本
 
-当前：`v1.2.2`
+当前：`v1.2.4`
 
 查看详细变更 → `CHANGELOG.md`

@@ -949,9 +949,9 @@ class KimiMonitorApp(rumps.App):
                 error = self.api.get_last_error() or self.api._work_error
                 self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")
                 return
-            # Code 和 Work 共用额度池：只显示一个月相，跟随 Work 主额度
-            icon_source = work_info or code_info
-            title = f"{self._icon_for(icon_source.percent)} " + " · ".join(parts)
+            # Code 和 Work 共用额度池：月相按两边百分比之和（封顶 100%）
+            combined = (code_info.percent if code_info else 0) + (work_info.percent if work_info else 0)
+            title = f"{self._icon_for(min(100, combined))} " + " · ".join(parts)
         else:
             if not code_info:
                 error = self.api.get_last_error()

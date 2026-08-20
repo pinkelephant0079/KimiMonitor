@@ -34,10 +34,11 @@ from version import VERSION, VERSION_NAME, GITHUB_RELEASES_API, GITHUB_RELEASES_
 # ═══════════════════════════════════════════════════════════
 
 API_URL = "https://api.kimi.com/coding/v1/usages"
-WORK_API_URL = "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription"
+WORK_API_URL = "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
 APP_NAME = "KimiMonitor"
 TOKEN_PATH = Path.home() / ".kimi" / "credentials" / "kimi-code.json"
-WORK_KEY_PATH = Path.home() / "Library" / "Application Support" / "kimi-desktop" / "bridge-store" / "token-store.json"
+# Work 凭证：桌面端 Cookies 数据库里的 kimi-auth（明文 JWT，桌面端自行续期，App 只读）
+WORK_COOKIE_DB = Path.home() / "Library" / "Application Support" / "kimi-desktop" / "Cookies"
 DEVICE_ID_PATH = Path.home() / ".kimi" / "device_id"
 CONFIG_PATH = Path.home() / ".kimi_monitor_app_config.json"
 SIGNAL_PATH = Path.home() / ".kimi_monitor_refresh_signal"
@@ -76,8 +77,8 @@ class UsageInfo:
 class KimiUsageData:
     weekly: Optional[UsageInfo]
     rate_limit: Optional[UsageInfo]
-    work: Optional[UsageInfo] = None
-    work_gift: Optional[UsageInfo] = None
+    work: Optional[UsageInfo] = None        # Work 本月消耗（总量 - Code）
+    code_month: Optional[UsageInfo] = None  # Code 本月消耗
 
 
 # ═══════════════════════════════════════════════════════════
@@ -452,17 +453,43 @@ class KimiAPIClient:
 
         return KimiUsageData(weekly=weekly, rate_limit=rate_limit)
 
+    @staticmethod
+    def _read_work_token() -> Optional[str]:
+        """从桌面端 Cookies 数据库读取 kimi-auth（明文 JWT）。复制后读，避免锁库。"""
+        if not WORK_COOKIE_DB.exists():
+            return None
+        import shutil
+        import sqlite3
+        import tempfile
+        tmp = Path(tempfile.gettempdir()) / "kimi_monitor_cookies.db"
+        try:
+            shutil.copy2(WORK_COOKIE_DB, tmp)
+            db = sqlite3.connect(str(tmp))
+            try:
+                row = db.execute(
+                    "SELECT value FROM cookies WHERE name='kimi-auth' AND value != '' "
+                    "ORDER BY expires_utc DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                db.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def fetch_work(self) -> tuple[Optional[UsageInfo], Optional[UsageInfo]]:
-        """拉取 Kimi Work 订阅主额度（GetSubscription），返回 (主额度, 赠送额度)；
-        桌面端凭证文件不存在（未安装/未登录）时静默返回 (None, None)"""
-        if not WORK_KEY_PATH.exists():
+        """拉取本月订阅消耗（GetSubscriptionStats），返回 (Work 月度, Code 月度)；
+        总量 = amountUsedRatio，Code 月度 = kimiCodeUsedRatio，Work 月度 = 总量 - Code。
+        桌面端未安装/未登录时静默返回 (None, None)"""
+        token = self._read_work_token()
+        if not token:
+            self._work_error = "凭证缺失"
             return None, None
         try:
-            with open(WORK_KEY_PATH, "r", encoding="utf-8") as f:
-                token = json.load(f).get("tokens", {}).get("access_token")
-            if not token:
-                self._work_error = "凭证无效"
-                return None, None
             resp = requests.post(
                 WORK_API_URL,
                 headers={
@@ -474,33 +501,30 @@ class KimiAPIClient:
                 timeout=(3, 10),
             )
             if resp.status_code in (401, 403):
-                # web token 失效（桌面端会自行刷新该文件，下一轮自动恢复）：静默降级
+                # cookie 失效（桌面端运行中会自动续期，下一轮自动恢复）：静默降级
                 self._work_error = "授权失效"
                 return None, None
             if resp.status_code != 200:
                 self._work_error = f"HTTP {resp.status_code}"
                 return None, None
 
-            main_info = None
-            gift_info = None
-            for bal in resp.json().get("balances", []):
-                ratio = bal.get("amountUsedRatio")
-                if ratio is None:
-                    continue
-                percent = min(int(float(ratio) * 100 + 0.5), 100)
-                reset_text, reset_epoch = self._parse_reset_time(bal.get("expireTime", ""))
-                bal_type = bal.get("type")
-                label = "Work 月度额度" if bal_type == "SUBSCRIPTION" else "Work 赠送额度"
-                info = UsageInfo(
+            bal = resp.json().get("subscriptionBalance")
+            if not bal:
+                self._work_error = "无订阅额度"
+                return None, None
+            total = float(bal.get("amountUsedRatio") or 0)
+            code_ratio = float(bal.get("kimiCodeUsedRatio") or 0)
+            reset_text, reset_epoch = self._parse_reset_time(bal.get("expireTime", ""))
+
+            def mk(label: str, ratio: float) -> UsageInfo:
+                percent = min(max(int(ratio * 100 + 0.5), 0), 100)
+                return UsageInfo(
                     label=label, used=percent, limit=100, percent=percent,
                     reset_text=reset_text, reset_epoch=reset_epoch,
                 )
-                if bal_type == "SUBSCRIPTION":
-                    main_info = info
-                elif bal_type == "GIFT":
-                    gift_info = info
-            self._work_error = None if main_info else "无订阅额度"
-            return main_info, gift_info
+
+            self._work_error = None
+            return mk("Work 月度额度", total - code_ratio), mk("Code 月度消耗", code_ratio)
         except requests.Timeout:
             self._work_error = "请求超时"
         except Exception as e:
@@ -574,7 +598,7 @@ class KimiMonitorApp(rumps.App):
         self.menu.add(rumps.MenuItem("📊 CLI 周调用配额"))
         self.menu.add(rumps.MenuItem("📊 5小时频限"))
         self.menu.add(rumps.MenuItem("📊 Work 月度额度"))
-        self.menu.add(rumps.MenuItem("🎁 Work 赠送额度"))
+        self.menu.add(rumps.MenuItem("📊 Code 月度消耗"))
         self.menu.add(None)
         self.menu.add(rumps.MenuItem("🔄 立即刷新", callback=self.on_refresh))
         self.menu.add(None)
@@ -632,12 +656,12 @@ class KimiMonitorApp(rumps.App):
                 msg = self._result_queue.get(timeout=1)
                 if msg == "refresh":
                     data = self.api.fetch()
-                    work, work_gift = self.api.fetch_work()
-                    if data is None and (work or work_gift):
+                    work, code_month = self.api.fetch_work()
+                    if data is None and (work or code_month):
                         data = KimiUsageData(weekly=None, rate_limit=None)
                     if data is not None:
                         data.work = work
-                        data.work_gift = work_gift
+                        data.code_month = code_month
                     # 等待 rumps.App.run() 初始化 _nsapp 并进入事件循环
                     while self._running and (not hasattr(self, '_nsapp') or self._nsapp is None):
                         time.sleep(0.1)
@@ -931,6 +955,7 @@ class KimiMonitorApp(rumps.App):
                 return
 
         code_info = data.rate_limit if data else None
+        code_month_info = data.code_month if data else None
         work_info = data.work if data else None
 
         if source == "work":
@@ -941,16 +966,16 @@ class KimiMonitorApp(rumps.App):
             title = f"{self._icon_for(work_info.percent)} {self._styled_text(work_info)}"
         elif source == "both":
             parts = []
-            if code_info:
-                parts.append(self._styled_text(code_info))
+            if code_month_info:
+                parts.append(self._styled_text(code_month_info))
             if work_info:
                 parts.append(self._styled_text(work_info))
             if not parts:
                 error = self.api.get_last_error() or self.api._work_error
                 self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")
                 return
-            # Code 和 Work 共用额度池：月相按两边百分比之和（封顶 100%）
-            combined = (code_info.percent if code_info else 0) + (work_info.percent if work_info else 0)
+            # 总量口径：Code 本月消耗 + Work 本月消耗，月相按两者之和（封顶 100%）
+            combined = (code_month_info.percent if code_month_info else 0) + (work_info.percent if work_info else 0)
             title = f"{self._icon_for(min(100, combined))} " + " · ".join(parts)
         else:
             if not code_info:
@@ -977,11 +1002,11 @@ class KimiMonitorApp(rumps.App):
             error = self.api.get_last_error()
             self.menu["📊 5小时频限"].title = f"📊 5小时频限: {error or '--'}"
 
-        # 未安装 Kimi Work（无凭证文件）时整行隐藏
+        # 未安装 Kimi 桌面端（无 Cookies 数据库）时整行隐藏
         try:
-            hidden = not WORK_KEY_PATH.exists()
+            hidden = not WORK_COOKIE_DB.exists()
             self.menu["📊 Work 月度额度"]._menuitem.setHidden_(hidden)
-            self.menu["🎁 Work 赠送额度"]._menuitem.setHidden_(hidden or not (data and data.work_gift))
+            self.menu["📊 Code 月度消耗"]._menuitem.setHidden_(hidden)
         except Exception:
             pass
         if data and data.work:
@@ -989,9 +1014,11 @@ class KimiMonitorApp(rumps.App):
             self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {w.percent}% · {w.reset_text}"
         else:
             self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {self.api._work_error or '--'}"
-        if data and data.work_gift:
-            g = data.work_gift
-            self.menu["🎁 Work 赠送额度"].title = f"🎁 Work 赠送额度: {g.percent}% · {g.reset_text}"
+        if data and data.code_month:
+            cm = data.code_month
+            self.menu["📊 Code 月度消耗"].title = f"📊 Code 月度消耗: {cm.percent}% · {cm.reset_text}"
+        else:
+            self.menu["📊 Code 月度消耗"].title = f"📊 Code 月度消耗: {self.api._work_error or '--'}"
 
         source = self.config.get("menubar_source", "code")
         for key, item in self._menubar_items.items():

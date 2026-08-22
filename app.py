@@ -68,7 +68,7 @@ class UsageInfo:
     label: str
     used: int
     limit: int
-    percent: int
+    percent: float
     reset_text: str
     reset_epoch: Optional[float]
 
@@ -433,7 +433,7 @@ class KimiAPIClient:
             used, limit = self._parse_used(usage)
             reset_str = usage.get("resetTime", "")
             reset_text, reset_epoch = self._parse_reset_time(reset_str)
-            percent = min(int(used * 100 / limit), 100) if limit > 0 else 0
+            percent = min(used * 100 / limit, 100.0) if limit > 0 else 0.0
             weekly = UsageInfo(
                 label="CLI 周调用配额", used=used, limit=limit, percent=percent,
                 reset_text=reset_text, reset_epoch=reset_epoch,
@@ -445,7 +445,7 @@ class KimiAPIClient:
             used, limit = self._parse_used(detail)
             reset_str = detail.get("resetTime", "")
             reset_text, reset_epoch = self._parse_reset_time(reset_str)
-            percent = min(int(used * 100 / limit), 100) if limit > 0 else 0
+            percent = min(used * 100 / limit, 100.0) if limit > 0 else 0.0
             rate_limit = UsageInfo(
                 label="5小时频限", used=used, limit=limit, percent=percent,
                 reset_text=reset_text, reset_epoch=reset_epoch,
@@ -517,7 +517,7 @@ class KimiAPIClient:
             reset_text, reset_epoch = self._parse_reset_time(bal.get("expireTime", ""))
 
             def mk(label: str, ratio: float) -> UsageInfo:
-                percent = min(max(int(ratio * 100 + 0.5), 0), 100)
+                percent = min(max(ratio * 100, 0.0), 100.0)
                 return UsageInfo(
                     label=label, used=percent, limit=100, percent=percent,
                     reset_text=reset_text, reset_epoch=reset_epoch,
@@ -918,7 +918,7 @@ class KimiMonitorApp(rumps.App):
             nsitem.setVisible_(True)
 
     @staticmethod
-    def _icon_for(percent: int) -> str:
+    def _icon_for(percent: float) -> str:
         """月相图标：5 相渐盈，100% 为满月"""
         return MOON_PHASES[min(4, int(percent * 5 / 100))]
 
@@ -926,21 +926,21 @@ class KimiMonitorApp(rumps.App):
         """按当前显示风格格式化一条额度数据（不含图标）"""
         style = self.config.get("style", "percent_countdown")
         if style == "percent":
-            return f"{info.percent}%"
+            return f"{info.percent:.2f}%"
         if style == "percent_countdown":
             if info.reset_text and info.reset_text != "已重置":
-                return f"{info.percent}% · {info.reset_text}"
-            return f"{info.percent}%"
+                return f"{info.percent:.2f}% · {info.reset_text}"
+            return f"{info.percent:.2f}%"
         if style == "remaining":
-            return f"剩{max(0, 100 - info.percent)}%"
+            return f"剩{max(0, 100 - info.percent):.2f}%"
         if style == "remaining_countdown":
             remaining = max(0, 100 - info.percent)
             if info.reset_text and info.reset_text != "已重置":
-                return f"剩{remaining}% · {info.reset_text}"
-            return f"剩{remaining}%"
+                return f"剩{remaining:.2f}% · {info.reset_text}"
+            return f"剩{remaining:.2f}%"
         if style == "progress":
             return self._progress_bar(info.percent)
-        return f"{info.percent}%"
+        return f"{info.percent:.2f}%"
 
     def _update_title(self, data: Optional[KimiUsageData]):
         source = self.config.get("menubar_source", "code")
@@ -991,13 +991,13 @@ class KimiMonitorApp(rumps.App):
     def _update_menu(self, data: Optional[KimiUsageData]):
         if data and data.weekly:
             w = data.weekly
-            self.menu["📊 CLI 周调用配额"].title = f"📊 CLI 周调用配额: {w.used}/{w.limit} ({w.percent}%) · {w.reset_text}"
+            self.menu["📊 CLI 周调用配额"].title = f"📊 CLI 周调用配额: {w.used}/{w.limit} ({w.percent:.2f}%) · {w.reset_text}"
         else:
             self.menu["📊 CLI 周调用配额"].title = "📊 CLI 周调用配额: --"
 
         if data and data.rate_limit:
             rl = data.rate_limit
-            self.menu["📊 5小时频限"].title = f"📊 5小时频限: {rl.used}/{rl.limit} ({rl.percent}%) · {rl.reset_text}"
+            self.menu["📊 5小时频限"].title = f"📊 5小时频限: {rl.used}/{rl.limit} ({rl.percent:.2f}%) · {rl.reset_text}"
         else:
             error = self.api.get_last_error()
             self.menu["📊 5小时频限"].title = f"📊 5小时频限: {error or '--'}"
@@ -1011,12 +1011,12 @@ class KimiMonitorApp(rumps.App):
             pass
         if data and data.work:
             w = data.work
-            self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {w.percent}% · {w.reset_text}"
+            self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {w.percent:.2f}% · {w.reset_text}"
         else:
             self.menu["📊 Work 月度额度"].title = f"📊 Work 月度额度: {self.api._work_error or '--'}"
         if data and data.code_month:
             cm = data.code_month
-            self.menu["📊 Code 月度消耗"].title = f"📊 Code 月度消耗: {cm.percent}% · {cm.reset_text}"
+            self.menu["📊 Code 月度消耗"].title = f"📊 Code 月度消耗: {cm.percent:.2f}% · {cm.reset_text}"
         else:
             self.menu["📊 Code 月度消耗"].title = f"📊 Code 月度消耗: {self.api._work_error or '--'}"
 
@@ -1028,7 +1028,7 @@ class KimiMonitorApp(rumps.App):
         for key, item in self._style_items.items():
             item.state = 1 if key == style else 0
 
-    def _progress_bar(self, percent: int, width: int = 10) -> str:
+    def _progress_bar(self, percent: float, width: int = 10) -> str:
         filled = percent * width // 100
         filled = min(filled, width)
         empty = width - filled

@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
     "style": "percent_countdown",
     "refresh_interval": 60,
     "idle_threshold": 300,  # 5分钟空闲认为屏幕无人
-    "menubar_source": "code",  # 菜单栏显示: code / work / both
+    "menubar_source": "code",  # 菜单栏显示: code / work / both / freq_and_total
     "colors": {
         "normal": "#FFFFFF",
         "warning": "#FF9500",
@@ -613,9 +613,9 @@ class KimiMonitorApp(rumps.App):
             style_menu.add(item)
         self.menu.add(style_menu)
 
-        # 菜单栏显示来源：仅 Code / 仅 Work / 双显
+        # 菜单栏显示来源：仅 Code / 仅 Work / 双显 / 频限+总额
         menubar_menu = rumps.MenuItem("🖥 菜单栏显示")
-        for key, label in [("code", "仅 Code 频限"), ("work", "仅 Work 额度"), ("both", "Code + Work 双显")]:
+        for key, label in [("code", "仅 Code 频限"), ("work", "仅 Work 额度"), ("both", "Code + Work 双显"), ("freq_and_total", "频限+总额")]:
             self._menubar_items[key] = rumps.MenuItem(label, callback=lambda _, k=key: self.set_menubar_source(k))
             menubar_menu.add(self._menubar_items[key])
         self.menu.add(menubar_menu)
@@ -945,8 +945,8 @@ class KimiMonitorApp(rumps.App):
     def _update_title(self, data: Optional[KimiUsageData]):
         source = self.config.get("menubar_source", "code")
 
-        # 熔断状态优先显示（仅 Code 来源时）
-        if source == "code":
+        # 熔断状态优先显示（Code 相关来源）
+        if source in ("code", "freq_and_total"):
             if self.api._silent_mode and self.api._consecutive_failures >= 3:
                 self._set_title("⚠️ 失去连接")
                 return
@@ -977,6 +977,16 @@ class KimiMonitorApp(rumps.App):
             # 总量口径：Code 本月消耗 + Work 本月消耗，月相按两者之和（封顶 100%）
             combined = (code_month_info.percent if code_month_info else 0) + (work_info.percent if work_info else 0)
             title = f"{self._icon_for(min(100, combined))} " + " · ".join(parts)
+        elif source == "freq_and_total":
+            if not code_info:
+                error = self.api.get_last_error()
+                self._set_title(f"⚠️ {error[:8]}" if error else "⚠️ --")
+                return
+            # 总额度 = Code 月度 + Work 月度
+            combined = (code_month_info.percent if code_month_info else 0) + (work_info.percent if work_info else 0)
+            freq_text = self._styled_text(code_info)
+            total_text = f"{combined:.2f}%"
+            title = f"{self._icon_for(min(100, combined))} {freq_text} · {total_text}"
         else:
             if not code_info:
                 error = self.api.get_last_error()

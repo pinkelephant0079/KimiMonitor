@@ -199,6 +199,11 @@ class KimiAPIClient:
         self._silent_mode = False
         # Work 额度错误状态（与 Code 独立容错）
         self._work_error = None
+        # Work 唤起熔断：限制自动唤起 Kimi Desktop 的频率
+        self._work_relaunch_count = 0
+        self._work_max_relaunch = 3
+        self._work_last_relaunch_time = 0
+        self._work_relaunch_cooldown = 600  # 10 分钟内最多唤起一次
 
     def _read_token(self) -> Optional[str]:
         if self._token:
@@ -481,50 +486,80 @@ class KimiAPIClient:
             except Exception:
                 pass
 
+    def _relaunch_kimi_desktop(self) -> bool:
+        """唤起 Kimi Desktop，让它自行续期 kimi-auth。成功返回 True。"""
+        now = time.time()
+        # 冷却检查
+        if now - self._work_last_relaunch_time < self._work_relaunch_cooldown:
+            return False
+        # 熔断检查
+        if self._work_relaunch_count >= self._work_max_relaunch:
+            return False
+        try:
+            print("[Work] 唤起 Kimi Desktop 续期...")
+            subprocess.run(["open", "-a", "Kimi"], timeout=10, check=False)
+            self._work_last_relaunch_time = now
+            self._work_relaunch_count += 1
+            return True
+        except Exception as e:
+            print(f"[Work] 唤起失败: {e}")
+            return False
+
     def fetch_work(self) -> tuple[Optional[UsageInfo], Optional[UsageInfo]]:
-        """拉取本月订阅消耗（GetSubscriptionStats），返回 (Work 月度, Code 月度)；
-        总量 = amountUsedRatio，Code 月度 = kimiCodeUsedRatio，Work 月度 = 总量 - Code。
-        桌面端未安装/未登录时静默返回 (None, None)"""
-        token = self._read_work_token()
+        """通过 CLI token 的 coding/v1/usages 端点获取 Work 月度额度。
+        使用 boosterWallet.balance 代币数据计算使用比例，与 Kimi 网页端"总使用量"保持一致。
+        不再依赖桌面端 kimi-auth cookie。"""
+        token = self._read_token()
         if not token:
             self._work_error = "凭证缺失"
             return None, None
         try:
-            resp = requests.post(
-                WORK_API_URL,
+            resp = requests.get(
+                API_URL,
                 headers={
                     "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
+                    "X-Msh-Platform": "kimi_cli",
+                    "X-Msh-Device-Id": self._read_device_id(),
                     "User-Agent": f"KimiMonitor/{VERSION}",
                 },
-                json={},
                 timeout=(3, 10),
             )
-            if resp.status_code in (401, 403):
-                # cookie 失效（桌面端运行中会自动续期，下一轮自动恢复）：静默降级
-                self._work_error = "授权失效"
-                return None, None
             if resp.status_code != 200:
                 self._work_error = f"HTTP {resp.status_code}"
                 return None, None
 
-            bal = resp.json().get("subscriptionBalance")
-            if not bal:
-                self._work_error = "无订阅额度"
-                return None, None
-            total = float(bal.get("amountUsedRatio") or 0)
-            code_ratio = float(bal.get("kimiCodeUsedRatio") or 0)
-            reset_text, reset_epoch = self._parse_reset_time(bal.get("expireTime", ""))
+            payload = resp.json()
+            booster = payload.get("boosterWallet", {})
+            balance = booster.get("balance", {})
 
-            def mk(label: str, ratio: float) -> UsageInfo:
-                percent = min(max(ratio * 100, 0.0), 100.0)
-                return UsageInfo(
-                    label=label, used=percent, limit=100, percent=percent,
-                    reset_text=reset_text, reset_epoch=reset_epoch,
-                )
+            amount = int(balance.get("amount", 0))
+            amount_left = int(balance.get("amountLeft", 0))
+
+            if amount <= 0:
+                self._work_error = "无额度数据"
+                return None, None
+
+            used = amount - amount_left
+            # 使用 (已用 + 剩余) 作为总量，与 Kimi 网页端"总使用量"口径一致
+            total = amount + amount_left
+            percent = min(used * 100 / total, 100.0)
+
+            # 重置时间取 boosterWallet balance 的 periodEnd
+            reset_text, reset_epoch = self._parse_reset_time(balance.get("periodEnd", ""))
+
+            work_info = UsageInfo(
+                label="Work 月度额度",
+                used=percent,
+                limit=100,
+                percent=percent,
+                reset_text=reset_text,
+                reset_epoch=reset_epoch,
+            )
 
             self._work_error = None
-            return mk("Work 月度额度", total - code_ratio), mk("Code 月度消耗", code_ratio)
+            # 返回 (Work 月度额度, None) — 不再拆分 Code 月度消耗
+            return work_info, None
+
         except requests.Timeout:
             self._work_error = "请求超时"
         except Exception as e:

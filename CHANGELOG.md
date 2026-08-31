@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.1] - 2026-08-31
+
+### 修复
+- **Work 额度计算逻辑**：从 `monthlyUsed / monthlyChargeLimit`（月度消费金额比例，~94%）改为 `boosterWallet.balance` 代币数据 `(amount - amountLeft) / (amount + amountLeft)`（~73%），与 Kimi 网页端"总使用量"显示一致
+- **凭证来源**：不再依赖桌面端 `kimi-auth` Cookie（已过期 6 天且无法自动刷新），改为使用 CLI Token 访问 `coding/v1/usages` 端点
+
+### 变更
+- 版本号 1.3.0 → 1.3.1
+
 所有版本变更均按 [Keep a Changelog](https://keepachangelog.com/) 格式记录。
 
 ## [1.3.0] - 2026-08-20

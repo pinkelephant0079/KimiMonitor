@@ -10,17 +10,20 @@ if hasattr(sys.stdout, 'buffer'):
     sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
     sys.stderr = open(sys.stderr.fileno(), mode='w', encoding='utf-8', buffering=1)
 
+import base64
+import fcntl
 import json
 import os
 import queue
 import random
+import re
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 import requests
 import rumps
@@ -37,11 +40,30 @@ API_URL = "https://api.kimi.com/coding/v1/usages"
 WORK_API_URL = "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
 APP_NAME = "KimiMonitor"
 TOKEN_PATH = Path.home() / ".kimi" / "credentials" / "kimi-code.json"
-# Work 凭证：桌面端 Cookies 数据库里的 kimi-auth（明文 JWT，桌面端自行续期，App 只读）
-WORK_COOKIE_DB = Path.home() / "Library" / "Application Support" / "kimi-desktop" / "Cookies"
+WORK_DESKTOP_DIR = Path.home() / "Library" / "Application Support" / "kimi-desktop"
+WORK_LEVELDB_DIR = WORK_DESKTOP_DIR / "Local Storage" / "leveldb"
+WORK_COOKIE_DB = WORK_DESKTOP_DIR / "Cookies"
+WORK_JWT_PATTERN = re.compile(rb"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
 DEVICE_ID_PATH = Path.home() / ".kimi" / "device_id"
 CONFIG_PATH = Path.home() / ".kimi_monitor_app_config.json"
 SIGNAL_PATH = Path.home() / ".kimi_monitor_refresh_signal"
+INSTANCE_LOCK_PATH = Path.home() / ".kimi_monitor_app.lock"
+
+
+def acquire_single_instance_lock() -> Optional[TextIO]:
+    """持有跨路径的文件锁；返回的文件对象必须在应用生命周期内保持打开。"""
+    lock_file = INSTANCE_LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(f"{os.getpid()}\n")
+    lock_file.flush()
+    return lock_file
+
 
 DEFAULT_CONFIG = {
     "style": "percent_countdown",
@@ -459,8 +481,53 @@ class KimiAPIClient:
         return KimiUsageData(weekly=weekly, rate_limit=rate_limit)
 
     @staticmethod
-    def _read_work_token() -> Optional[str]:
-        """从桌面端 Cookies 数据库读取 kimi-auth（明文 JWT）。复制后读，避免锁库。"""
+    def _jwt_claims(token: str) -> Optional[dict]:
+        """只解码本机 JWT 的元数据，不验证签名；服务端仍会校验令牌。"""
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload))
+        except (ValueError, IndexError, json.JSONDecodeError):
+            return None
+
+    @classmethod
+    def _read_work_token(cls) -> Optional[str]:
+        """优先读新版桌面端 Local Storage 的短期访问令牌，旧 Cookie 仅作兜底。"""
+        candidates = []
+        if WORK_LEVELDB_DIR.exists():
+            paths = sorted(
+                (path for path in WORK_LEVELDB_DIR.glob("*") if path.suffix in (".log", ".ldb")),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for path in paths:
+                try:
+                    content = path.read_bytes()
+                except OSError:
+                    continue
+                for match in WORK_JWT_PATTERN.finditer(content):
+                    token = match.group().decode("ascii")
+                    claims = cls._jwt_claims(token)
+                    if not claims:
+                        continue
+                    audience = claims.get("aud", [])
+                    if isinstance(audience, str):
+                        audience = [audience]
+                    try:
+                        expires_at = float(claims.get("exp", 0))
+                        issued_at = float(claims.get("iat", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    lifetime = expires_at - issued_at
+                    if (
+                        "kimi.com" in audience
+                        and expires_at > time.time() + 30
+                        and 0 < lifetime <= 86400
+                    ):
+                        candidates.append((issued_at, token))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+
         if not WORK_COOKIE_DB.exists():
             return None
         import shutil
@@ -477,7 +544,13 @@ class KimiAPIClient:
                 ).fetchone()
             finally:
                 db.close()
-            return row[0] if row else None
+            if not row:
+                return None
+            token = row[0]
+            claims = cls._jwt_claims(token)
+            if claims and float(claims.get("exp", 0)) <= time.time():
+                return None
+            return token
         except Exception:
             return None
         finally:
@@ -506,64 +579,90 @@ class KimiAPIClient:
             return False
 
     def fetch_work(self) -> tuple[Optional[UsageInfo], Optional[UsageInfo]]:
-        """通过 CLI token 的 coding/v1/usages 端点获取 Work 月度额度。
-        使用 boosterWallet.balance 代币数据计算使用比例，与 Kimi 网页端"总使用量"保持一致。
-        不再依赖桌面端 kimi-auth cookie。"""
+        """读取月度共享额度；加油包钱包与月度额度是两套不同口径。"""
+        cli_error = None
         token = self._read_token()
-        if not token:
-            self._work_error = "凭证缺失"
+        if token:
+            try:
+                resp = requests.get(
+                    API_URL,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Msh-Platform": "kimi_cli",
+                        "X-Msh-Device-Id": self._read_device_id(),
+                        "User-Agent": f"KimiMonitor/{VERSION}",
+                    },
+                    timeout=(3, 10),
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    monthly = payload.get("usages", {}).get("limit_month_total", {})
+                    ratio = monthly.get("used_ratio")
+                    if ratio is not None:
+                        percent = min(max(float(ratio) * 100, 0.0), 100.0)
+                        reset_text, reset_epoch = self._parse_reset_time(monthly.get("reset_time", ""))
+                        self._work_error = None
+                        return UsageInfo(
+                            label="Work 月度额度", used=percent, limit=100, percent=percent,
+                            reset_text=reset_text, reset_epoch=reset_epoch,
+                        ), None
+                else:
+                    cli_error = f"HTTP {resp.status_code}"
+            except requests.Timeout:
+                cli_error = "请求超时"
+            except Exception as e:
+                cli_error = str(e)
+
+        web_token = self._read_work_token()
+        if not web_token:
+            self._work_error = cli_error or "凭证缺失"
             return None, None
         try:
-            resp = requests.get(
-                API_URL,
+            resp = requests.post(
+                WORK_API_URL,
                 headers={
-                    "Authorization": f"Bearer {token}",
-                    "X-Msh-Platform": "kimi_cli",
-                    "X-Msh-Device-Id": self._read_device_id(),
+                    "Authorization": f"Bearer {web_token}",
+                    "Cookie": f"kimi-auth={web_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Connect-Protocol-Version": "1",
+                    "Origin": "https://www.kimi.com",
+                    "Referer": "https://www.kimi.com/code/console",
+                    "X-Msh-Platform": "web",
                     "User-Agent": f"KimiMonitor/{VERSION}",
                 },
+                json={},
                 timeout=(3, 10),
             )
+            if resp.status_code in (401, 403):
+                self._work_error = "授权失效"
+                return None, None
             if resp.status_code != 200:
                 self._work_error = f"HTTP {resp.status_code}"
                 return None, None
 
             payload = resp.json()
-            booster = payload.get("boosterWallet", {})
-            balance = booster.get("balance", {})
-
-            amount = int(balance.get("amount", 0))
-            amount_left = int(balance.get("amountLeft", 0))
-
-            if amount <= 0:
-                self._work_error = "无额度数据"
+            balance = payload.get("subscriptionBalance") or payload.get("subscription_balance")
+            if not balance:
+                self._work_error = "无订阅额度"
                 return None, None
-
-            used = amount - amount_left
-            # 使用 (已用 + 剩余) 作为总量，与 Kimi 网页端"总使用量"口径一致
-            total = amount + amount_left
-            percent = min(used * 100 / total, 100.0)
-
-            # 重置时间取 boosterWallet balance 的 periodEnd
-            reset_text, reset_epoch = self._parse_reset_time(balance.get("periodEnd", ""))
-
-            work_info = UsageInfo(
-                label="Work 月度额度",
-                used=percent,
-                limit=100,
-                percent=percent,
-                reset_text=reset_text,
-                reset_epoch=reset_epoch,
+            ratio = balance.get("amountUsedRatio", balance.get("amount_used_ratio"))
+            if ratio is None:
+                self._work_error = "无订阅额度"
+                return None, None
+            percent = min(max(float(ratio) * 100, 0.0), 100.0)
+            reset_text, reset_epoch = self._parse_reset_time(
+                balance.get("expireTime") or balance.get("expire_time") or ""
             )
-
             self._work_error = None
-            # 返回 (Work 月度额度, None) — 不再拆分 Code 月度消耗
-            return work_info, None
-
+            return UsageInfo(
+                label="Work 月度额度", used=percent, limit=100, percent=percent,
+                reset_text=reset_text, reset_epoch=reset_epoch,
+            ), None
         except requests.Timeout:
             self._work_error = "请求超时"
         except Exception as e:
-            self._work_error = f"{e}"
+            self._work_error = str(e)
         return None, None
 
     def get_last_error(self) -> Optional[str]:
@@ -1081,5 +1180,9 @@ class KimiMonitorApp(rumps.App):
 
 
 if __name__ == "__main__":
+    _instance_lock = acquire_single_instance_lock()
+    if _instance_lock is None:
+        print("KimiMonitor 已在运行，本次启动退出")
+        sys.exit(0)
     app = KimiMonitorApp()
     app.run()

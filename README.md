@@ -71,8 +71,8 @@ KimiMonitor 是一款 macOS 菜单栏应用，实时监控你的 [Kimi Code CLI]
 
 ## 数据隐私
 
-- 你的 OAuth Token 直接从 `~/.kimi/credentials/kimi-code.json` 读取，**不会上传到任何第三方服务器**
-- 所有 API 请求直接发送至 `api.kimi.com`
+- Code OAuth Token 直接从 `~/.kimi/credentials/kimi-code.json` 读取；Work 会话只读桌面端 Local Storage（旧 Cookie 兜底），**不会上传到任何第三方服务器**
+- Code 请求直接发送至 `api.kimi.com`，Work 月度统计请求直接发送至 `www.kimi.com`
 - 配置文件保存在本地 `~/.kimi_monitor_app_config.json`
 
 ## 更新日志

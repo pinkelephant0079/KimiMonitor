@@ -14,17 +14,18 @@ macOS 菜单栏应用，实时监控 Kimi 额度，不用开网页就能看用�
 |--------|--------|------|
 | Code 周配额（7天） | `GET https://api.kimi.com/coding/v1/usages` + OAuth | 返回 `remaining` 字段（不是 `used`！） |
 | Code 5小时频限 | 同上 `limits[0]`，window=300分钟 | 曾经误标"5分钟"，v1.2.1 已修正 |
-| **Work 月度额度**（= Code+Work 总量） | `POST https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` + Cookie token | `subscriptionBalance.amountUsedRatio`，与桌面端"我的额度"页同口径 |
-| Code 月度消耗 | 同上接口 | `kimiCodeUsedRatio` 字段 |
+| **Work 月度额度**（= Code+Work 总量） | 优先 `GET https://api.kimi.com/coding/v1/usages` 的 `usages.limit_month_total`；缺失时 `POST https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats` | `used_ratio` 或 `subscriptionBalance.amountUsedRatio`，与桌面端"我的额度"页同口径 |
+| Code 月度消耗 | Stats 接口 | `kimiCodeUsedRatio` 字段（当前菜单未拆分显示） |
 
-另有 Work 赠送池：v1.3.0 起已移除（赠送池过期，Stats 接口不返回）。
+另有 Work 赠送池：v1.3.0 起已移除（赠送池过期，Stats 接口不返回）。`booster_wallet` 是加油包钱包，**不是月度共享额度**，v1.3.2 起不再混用。
 
 ## 凭证位置（关键！）
 
 | 用途 | 文件 | 类型 |
 |------|------|------|
 | Code API | `~/.kimi/credentials/kimi-code.json` | OAuth，App 会自动刷新（熔断 3 次） |
-| Work API | `~/Library/Application Support/kimi-desktop/Cookies`（Electron sqlite）→ `kimi-auth` cookie 明文 JWT | 复制 db 到 /tmp 再读；**桌面端 v3.2.0 起 token-store.json 已废弃**。JWT 约 5 天有效，靠桌面端运行时续期，长期不开桌面端会"授权失效" |
+| Work API（优先） | `~/Library/Application Support/kimi-desktop/Local Storage/leveldb` | 只读筛选 `aud=kimi.com`、有效期 ≤ 24 小时且未过期的最新短期 JWT；桌面端运行时自动续期 |
+| Work API（兜底） | `~/Library/Application Support/kimi-desktop/Cookies` → `kimi-auth` | 旧版桌面端明文 JWT；已过期则忽略 |
 | ⚠️ 陷阱 | `agent-gw.kimi.com/coding/v1/usages` + `daimon-share/daimon/kimi-code-key.json` | 返回的 `totalQuota` 是**赠送池**，不是主额度！v1.1.0 踩过这个坑，v1.1.1 已纠正 |
 
 菜单栏图标：月相 5 相渐盈（0-19 🌑 / 20-39 🌒 / 40-59 🌓 / 60-79 🌔 / 80-100 🌕，用满即满月）。双显模式只显示一个月相，v1.3.0 起按 **Code 月度 + Work 月度** 百分比之和（封顶 100%，总量口径，不再是 5h 频限）。
@@ -78,8 +79,8 @@ GH_TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill | 
 
 ## 发版状态
 
-- 本地：`v1.3.0`（已部署运行中）
-- GitHub Release：`v1.2.4`，本地 v1.3.0 待推送发版
+- 本地：`v1.3.3`（已部署运行中，单实例锁已验证）
+- GitHub Release：`v1.2.4`，本地新版本待推送发版
 
 ---
 
@@ -126,6 +127,6 @@ GH_TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill | 
 
 ## 版本
 
-当前：`v1.3.0`
+当前：`v1.3.3`
 
 查看详细变更 → `CHANGELOG.md`

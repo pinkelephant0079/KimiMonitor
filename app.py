@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Iterator, Optional, TextIO
 
 import requests
 import rumps
@@ -44,6 +44,7 @@ WORK_DESKTOP_DIR = Path.home() / "Library" / "Application Support" / "kimi-deskt
 WORK_LEVELDB_DIR = WORK_DESKTOP_DIR / "Local Storage" / "leveldb"
 WORK_COOKIE_DB = WORK_DESKTOP_DIR / "Cookies"
 WORK_JWT_PATTERN = re.compile(rb"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+LEVELDB_MAGIC = b"\x57\xfb\x80\x8b\x24\x75\x47\xdb"
 DEVICE_ID_PATH = Path.home() / ".kimi" / "device_id"
 CONFIG_PATH = Path.home() / ".kimi_monitor_app_config.json"
 SIGNAL_PATH = Path.home() / ".kimi_monitor_refresh_signal"
@@ -63,6 +64,112 @@ def acquire_single_instance_lock() -> Optional[TextIO]:
     lock_file.write(f"{os.getpid()}\n")
     lock_file.flush()
     return lock_file
+
+
+def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """读取 LevelDB 使用的变长整数。"""
+    result = 0
+    shift = 0
+    while True:
+        if offset >= len(data) or shift >= 64:
+            raise ValueError("LevelDB varint 无效")
+        byte = data[offset]
+        offset += 1
+        result |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return result, offset
+        shift += 7
+
+
+def _decompress_snappy(data: bytes) -> bytes:
+    """解压 LevelDB 数据块使用的原始 Snappy 格式。"""
+    expected, offset = _read_varint(data, 0)
+    output = bytearray()
+    while offset < len(data):
+        tag = data[offset]
+        offset += 1
+        kind = tag & 3
+        if kind == 0:
+            length = tag >> 2
+            if length < 60:
+                length += 1
+            else:
+                count = length - 59
+                length = int.from_bytes(data[offset:offset + count], "little") + 1
+                offset += count
+            output.extend(data[offset:offset + length])
+            offset += length
+            continue
+        if kind == 1:
+            length = 4 + ((tag >> 2) & 7)
+            distance = ((tag >> 5) << 8) | data[offset]
+            offset += 1
+        elif kind == 2:
+            length = 1 + (tag >> 2)
+            distance = int.from_bytes(data[offset:offset + 2], "little")
+            offset += 2
+        else:
+            length = 1 + (tag >> 2)
+            distance = int.from_bytes(data[offset:offset + 4], "little")
+            offset += 4
+        if distance <= 0 or distance > len(output):
+            raise ValueError("Snappy 回引无效")
+        for _ in range(length):
+            output.append(output[-distance])
+    if len(output) != expected:
+        raise ValueError("Snappy 解压长度不匹配")
+    return bytes(output)
+
+
+def _leveldb_block(content: bytes, offset: int, size: int) -> bytes:
+    """读取一个 LevelDB 块，并按需解压。"""
+    if offset < 0 or size < 0 or offset + size + 5 > len(content):
+        raise ValueError("LevelDB 块越界")
+    raw = content[offset:offset + size]
+    compression = content[offset + size]
+    if compression == 0:
+        return raw
+    if compression == 1:
+        return _decompress_snappy(raw)
+    raise ValueError(f"未知 LevelDB 压缩类型: {compression}")
+
+
+def _leveldb_handle(data: bytes, offset: int) -> tuple[int, int, int]:
+    block_offset, offset = _read_varint(data, offset)
+    block_size, offset = _read_varint(data, offset)
+    return block_offset, block_size, offset
+
+
+def _leveldb_entries(data: bytes) -> Iterator[tuple[bytes, bytes]]:
+    """遍历 LevelDB 索引块中的键值项。"""
+    offset = 0
+    previous = b""
+    while offset < len(data):
+        shared, offset = _read_varint(data, offset)
+        unshared, offset = _read_varint(data, offset)
+        value_length, offset = _read_varint(data, offset)
+        if shared == unshared == value_length == 0:
+            return
+        key = previous[:shared] + data[offset:offset + unshared]
+        offset += unshared
+        value = data[offset:offset + value_length]
+        offset += value_length
+        yield key, value
+        previous = key
+
+
+def _read_sstable_blocks(path: Path) -> Iterator[bytes]:
+    """只读遍历 SSTable 的数据块；CRC 不影响本机令牌元数据筛选。"""
+    content = path.read_bytes()
+    if len(content) < 48 or content[-8:] != LEVELDB_MAGIC:
+        raise ValueError("不是有效的 LevelDB SSTable")
+    footer = content[-48:-8]
+    _, _, cursor = _leveldb_handle(footer, 0)
+    index_offset, index_size, _ = _leveldb_handle(footer, cursor)
+    index = _leveldb_block(content, index_offset, index_size)
+    for _, value in _leveldb_entries(index):
+        data_offset, data_size, _ = _leveldb_handle(value, 0)
+        yield _leveldb_block(content, data_offset, data_size)
 
 
 DEFAULT_CONFIG = {
@@ -502,29 +609,35 @@ class KimiAPIClient:
             )
             for path in paths:
                 try:
-                    content = path.read_bytes()
-                except OSError:
+                    contents = (
+                        [path.read_bytes()]
+                        if path.suffix == ".log"
+                        else list(_read_sstable_blocks(path))
+                    )
+                except (OSError, ValueError, IndexError) as e:
+                    print(f"[Work] 读取 LevelDB 失败 {path.name}: {e}")
                     continue
-                for match in WORK_JWT_PATTERN.finditer(content):
-                    token = match.group().decode("ascii")
-                    claims = cls._jwt_claims(token)
-                    if not claims:
-                        continue
-                    audience = claims.get("aud", [])
-                    if isinstance(audience, str):
-                        audience = [audience]
-                    try:
-                        expires_at = float(claims.get("exp", 0))
-                        issued_at = float(claims.get("iat", 0))
-                    except (TypeError, ValueError):
-                        continue
-                    lifetime = expires_at - issued_at
-                    if (
-                        "kimi.com" in audience
-                        and expires_at > time.time() + 30
-                        and 0 < lifetime <= 86400
-                    ):
-                        candidates.append((issued_at, token))
+                for content in contents:
+                    for match in WORK_JWT_PATTERN.finditer(content):
+                        token = match.group().decode("ascii")
+                        claims = cls._jwt_claims(token)
+                        if not claims:
+                            continue
+                        audience = claims.get("aud", [])
+                        if isinstance(audience, str):
+                            audience = [audience]
+                        try:
+                            expires_at = float(claims.get("exp", 0))
+                            issued_at = float(claims.get("iat", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        lifetime = expires_at - issued_at
+                        if (
+                            "kimi.com" in audience
+                            and expires_at > time.time() + 30
+                            and 0 < lifetime <= 86400
+                        ):
+                            candidates.append((issued_at, token))
         if candidates:
             return max(candidates, key=lambda item: item[0])[1]
 

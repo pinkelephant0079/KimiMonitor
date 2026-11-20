@@ -24,7 +24,7 @@ macOS 菜单栏应用，实时监控 Kimi 额度，不用开网页就能看用�
 | 用途 | 文件 | 类型 |
 |------|------|------|
 | Code API | `~/.kimi/credentials/kimi-code.json` | OAuth，App 会自动刷新（熔断 3 次） |
-| Work API（优先） | `~/Library/Application Support/kimi-desktop/Local Storage/leveldb` | 只读筛选 `aud=kimi.com`、有效期 ≤ 24 小时且未过期的最新短期 JWT；桌面端运行时自动续期 |
+| Work API（优先） | `~/Library/Application Support/kimi-desktop/Local Storage/leveldb` | 支持未压缩 `.log` 与 Snappy 压缩 `.ldb`；只读筛选 `aud=kimi.com`、有效期 ≤ 24 小时且未过期的最新短期 JWT |
 | Work API（兜底） | `~/Library/Application Support/kimi-desktop/Cookies` → `kimi-auth` | 旧版桌面端明文 JWT；已过期则忽略 |
 | ⚠️ 陷阱 | `agent-gw.kimi.com/coding/v1/usages` + `daimon-share/daimon/kimi-code-key.json` | 返回的 `totalQuota` 是**赠送池**，不是主额度！v1.1.0 踩过这个坑，v1.1.1 已纠正 |
 
@@ -79,8 +79,8 @@ GH_TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill | 
 
 ## 发版状态
 
-- 本地：`v1.3.3`（已部署运行中，单实例锁已验证）
-- GitHub Release：`v1.2.4`，本地新版本待推送发版
+- 本地：`v1.3.4`（压缩 LevelDB 会话读取已验证）
+- GitHub Release：`v1.3.4`
 
 ---
 
@@ -127,6 +127,6 @@ GH_TOKEN=$(printf "protocol=https\nhost=github.com\n\n" | git credential fill | 
 
 ## 版本
 
-当前：`v1.3.3`
+当前：`v1.3.4`
 
 查看详细变更 → `CHANGELOG.md`

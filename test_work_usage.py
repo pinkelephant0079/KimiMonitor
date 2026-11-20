@@ -31,6 +31,59 @@ def make_jwt(issued_at: float, expires_at: float) -> str:
     return f"{header}.{payload}.c2lnbmF0dXJl"
 
 
+def encode_varint(value: int) -> bytes:
+    result = bytearray()
+    while value >= 0x80:
+        result.append((value & 0x7F) | 0x80)
+        value >>= 7
+    result.append(value)
+    return bytes(result)
+
+
+def snappy_literal(data: bytes) -> bytes:
+    """生成测试用的 Snappy 流，生产代码仍需支持字面量和回引。"""
+    result = bytearray(encode_varint(len(data)))
+    offset = 0
+    while offset < len(data):
+        chunk = data[offset:offset + 65536]
+        offset += len(chunk)
+        length = len(chunk)
+        if length <= 60:
+            result.append((length - 1) << 2)
+            count = 0
+        else:
+            count = 1 if length <= 256 else 2
+            result.append((59 + count) << 2)
+            result.extend((length - 1).to_bytes(count, "little"))
+        result.extend(chunk)
+    return bytes(result)
+
+
+def leveldb_entry(key: bytes, value: bytes) -> bytes:
+    return encode_varint(0) + encode_varint(len(key)) + encode_varint(len(value)) + key + value
+
+
+def leveldb_block(entries: list[tuple[bytes, bytes]]) -> bytes:
+    content = b"".join(leveldb_entry(key, value) for key, value in entries)
+    return content + (0).to_bytes(4, "little") + (1).to_bytes(4, "little")
+
+
+def stored_snappy_block(content: bytes) -> bytes:
+    return snappy_literal(content) + b"\x01" + b"\x00" * 4
+
+
+def write_compressed_sstable(path: Path, content: bytes) -> None:
+    data = leveldb_block([(b"access_token", content)])
+    stored_data = stored_snappy_block(data)
+    data_handle = encode_varint(0) + encode_varint(len(stored_data) - 5)
+    index = leveldb_block([(b"data", data_handle)])
+    stored_index = stored_snappy_block(index)
+    footer = encode_varint(0) + encode_varint(0)
+    footer += encode_varint(len(stored_data)) + encode_varint(len(stored_index) - 5)
+    footer = footer.ljust(40, b"\x00") + app.LEVELDB_MAGIC
+    path.write_bytes(stored_data + stored_index + footer)
+
+
 class WorkUsageTests(unittest.TestCase):
     def test_cli_monthly_ratio_is_preferred(self) -> None:
         client = app.KimiAPIClient()
@@ -91,6 +144,28 @@ class WorkUsageTests(unittest.TestCase):
                 app, "WORK_COOKIE_DB", leveldb / "missing-cookies"
             ):
                 self.assertEqual(app.KimiAPIClient._read_work_token(), access)
+
+    def test_leveldb_reader_reads_current_access_token_from_compressed_table(self) -> None:
+        now = time.time()
+        access = make_jwt(now - 10, now + 890)
+        refresh = make_jwt(now - 10, now + 90 * 86400)
+        expired = make_jwt(now - 1000, now - 100)
+        with tempfile.TemporaryDirectory() as directory:
+            leveldb = Path(directory)
+            write_compressed_sstable(
+                leveldb / "000002.ldb",
+                b"\x00access_token\x00" + expired.encode("ascii")
+                + b"\x00refresh_token\x00" + refresh.encode("ascii")
+                + b"\x00access_token\x00" + access.encode("ascii") + b"\x00",
+            )
+            with patch.object(app, "WORK_LEVELDB_DIR", leveldb), patch.object(
+                app, "WORK_COOKIE_DB", leveldb / "missing-cookies"
+            ):
+                self.assertEqual(app.KimiAPIClient._read_work_token(), access)
+
+    def test_snappy_reader_handles_back_references(self) -> None:
+        compressed = b"\x09\x08abc\x16\x03\x00"
+        self.assertEqual(app._decompress_snappy(compressed), b"abcabcabc")
 
 
 class SingleInstanceTests(unittest.TestCase):
